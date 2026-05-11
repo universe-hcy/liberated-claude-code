@@ -8,6 +8,11 @@
 [![Bun](https://img.shields.io/badge/runtime-Bun-black?style=flat-square&logo=bun)](https://bun.sh/)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord)](https://discord.gg/uApuzJWGKX)
 
+## fork后改动了什么
+参照他人经验，解锁了Skill自动改进、记忆自动提取、SessionMemory, 新增Skill自动创建、跨 session上下文复用等，将claude code变为有长期记忆，同时能自主迭代skill的agent.
+由于盗火贤者分享的claude code源码不会再有后续更新，此处基于Claude Code Best进行改动，方便同步后续claude code的升级.
+
+
 > Which Claude do you like? The open source one is the best.
 
 牢 A (Anthropic) 官方 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 工具的源码反编译/逆向还原项目。目标是将 Claude Code 大部分功能及工程化能力复现 (问就是老佛爷已经付过钱了)。虽然很难绷, 但是它叫做 CCB(踩踩背)... 而且, 我们实现了企业版或者需要登陆 Claude 账号才能使用的特性, 实现技术普惠

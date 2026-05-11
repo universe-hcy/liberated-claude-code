@@ -190,12 +190,7 @@ Output <updates>[]</updates> if no updates are needed.`,
 }
 
 export function initSkillImprovement(): void {
-  if (
-    feature('SKILL_IMPROVEMENT') &&
-    getFeatureValue_CACHED_MAY_BE_STALE('tengu_copper_panda', false)
-  ) {
-    registerPostSamplingHook(createSkillImprovementHook())
-  }
+  registerPostSamplingHook(createSkillImprovementHook())
 }
 
 /**
