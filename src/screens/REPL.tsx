@@ -290,6 +290,7 @@ import {
   type CompactStrategyChoice,
   MAX_PUSH_DEPTH,
   setPushStackMirror,
+  projectPushStackOntoMessages,
 } from '../services/pushStack/state.js';
 import { DIGEST_PROMPT, DIGEST_TEMPLATE } from '../services/pushStack/digestPrompt.js';
 import { CompactStrategyDialog } from '../components/pushStack/CompactStrategyDialog.js';
@@ -317,6 +318,7 @@ import {
   isEphemeralToolProgress,
   isLoggableMessage,
   saveWorktreeState,
+  savePushStack,
   getAgentTranscript,
 } from '../utils/sessionStorage.js';
 import { deserializeMessages } from '../utils/conversationRecovery.js';
@@ -2344,6 +2346,28 @@ export function REPL({
         // Use a callback to ensure we're not dependent on stale state
         setMessages(() => messages);
 
+        // Hydrate the push/pop stack, re-projecting each marker onto the just-
+        // restored messages: a marker only survives if its anchor is still in
+        // the active context (not carried off by compaction/snip), the same
+        // check /pop performs — so a restored stack can never point at a message
+        // that no longer exists. Dropped markers are surfaced so a persisted
+        // stack is never silently lost. The setAppState below re-triggers the
+        // mirror effect, re-persisting the projected (pruned) stack last-wins.
+        // Skipped for /branch (fork) like worktreeSession: forkLog doesn't carry
+        // the stack.
+        if (feature('PUSH_POP') && entrypoint !== 'fork' && log.pushStack?.length) {
+          const { validMarkers, droppedCount } = projectPushStackOntoMessages(log.pushStack, messages);
+          setAppState(prev => ({ ...prev, pushStack: validMarkers }));
+          if (droppedCount > 0) {
+            addNotification({
+              key: 'push-stack-resume-dropped',
+              text: `${droppedCount} 个 push 点在恢复后已失效（被压缩/snip 卷走），已移除`,
+              priority: 'medium',
+              timeoutMs: 6000,
+            });
+          }
+        }
+
         // Clear any active tool JSX
         setToolJSX(null);
 
@@ -2363,7 +2387,7 @@ export function REPL({
         throw error;
       }
     },
-    [resetLoadingState, setAppState],
+    [resetLoadingState, setAppState, addNotification],
   );
 
   // Lazy init: useRef(createX()) would call createX on every render and
@@ -2918,9 +2942,17 @@ export function REPL({
   );
 
   // Keep the module-level mirror in sync so autoCompactIfNeeded (outside React)
-  // can read the current push stack without needing AppState access.
+  // can read the current push stack without needing AppState access. This is
+  // also the single point that fans in every stack mutation (push/pop/retain),
+  // so it doubles as the persistence trigger: once the stack has been non-empty,
+  // each change (including popping back to empty) is written last-wins so the
+  // transcript always reflects the live stack. The dirty ref keeps sessions that
+  // never push from writing an empty entry.
+  const pushStackDirty = useRef(false);
   useEffect(() => {
     setPushStackMirror(pushStack);
+    if (pushStack.length > 0) pushStackDirty.current = true;
+    if (pushStackDirty.current) savePushStack(pushStack);
   }, [pushStack]);
 
   // Ref holding the stable push/pop callbacks so getToolUseContext can forward-
@@ -3247,13 +3279,17 @@ export function REPL({
         ]);
         return;
       }
-      const lastContent =
-        (last as { content?: unknown; message?: { content?: unknown } }).content ??
-        (last as { content?: unknown; message?: { content?: unknown } }).message?.content ??
+      // Preview the user's most recent instruction (what this branch is about)
+      // rather than the raw last message — which is often a tool-only assistant
+      // turn (empty text) or a synthetic "No response requested." placeholder,
+      // neither of which is meaningful in `/push --list` (§4.7).
+      const instruction = msgs.findLast(selectableUserMessagesFilter);
+      const previewSource = instruction ?? last;
+      const previewContent =
+        (previewSource as { content?: unknown; message?: { content?: unknown } }).content ??
+        (previewSource as { content?: unknown; message?: { content?: unknown } }).message?.content ??
         '';
-      const anchorText =
-        getContentText(lastContent as string | import('@anthropic-ai/sdk/resources/index.mjs').ContentBlockParam[]) ??
-        '';
+      const anchorText = getContentText(previewContent as string | ContentBlockParam[]) ?? '';
       const anchorPreview = anchorText.slice(0, 75).trimEnd();
       const marker: PushMarker = {
         id: randomUUID(),
