@@ -121,6 +121,32 @@ function extractSystemText(system?: string | TextBlockParam[]): string {
 }
 
 /**
+ * Models that rejected the `temperature` parameter this session. Newer models
+ * (e.g. Opus 4.8) deprecated `temperature` entirely and return HTTP 400 when it
+ * is present. Populated reactively on the first such 400 so later sideQuery
+ * calls for that model skip the parameter without another wasted request.
+ */
+const temperatureUnsupportedModels = new Set<string>()
+
+/**
+ * True when an API error is the "temperature is deprecated / not supported for
+ * this model" 400. Matched on message text to stay robust across SDK
+ * error-shape changes; gated on the word "temperature" so unrelated 400s never
+ * trip it.
+ */
+export function isTemperatureDeprecatedError(error: unknown): boolean {
+  const msg = errorMessage(error).toLowerCase()
+  if (!msg.includes('temperature')) return false
+  return (
+    msg.includes('deprecat') ||
+    msg.includes('not supported') ||
+    msg.includes('unsupported') ||
+    msg.includes('does not support') ||
+    msg.includes('not permitted')
+  )
+}
+
+/**
  * Convert Anthropic MessageParam[] to a list of {role, content} objects
  * suitable for OpenAI-compatible chat.completions APIs.
  */
@@ -286,32 +312,63 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
           querySource: opts.querySource,
         })
 
+  // Newer models (e.g. Opus 4.8) reject `temperature`; skip it up-front for
+  // models already known to reject it this session, and reactively retry
+  // without it if the API returns the deprecation 400.
+  const buildCreateParams = (includeTemperature: boolean) => ({
+    model: normalizedModel,
+    max_tokens,
+    system: systemBlocks,
+    messages,
+    ...(tools && { tools }),
+    ...(tool_choice && { tool_choice }),
+    ...(output_format && { output_config: { format: output_format } }),
+    ...(includeTemperature && temperature !== undefined && { temperature }),
+    ...(stop_sequences && { stop_sequences }),
+    ...(thinkingConfig && { thinking: thinkingConfig }),
+    ...(betas.length > 0 && { betas }),
+    metadata: getAPIMetadata(),
+  })
+
+  const sendTemperature =
+    temperature !== undefined &&
+    !temperatureUnsupportedModels.has(normalizedModel)
+
   let response: BetaMessage
   try {
     response = await client.beta.messages.create(
-      {
-        model: normalizedModel,
-        max_tokens,
-        system: systemBlocks,
-        messages,
-        ...(tools && { tools }),
-        ...(tool_choice && { tool_choice }),
-        ...(output_format && { output_config: { format: output_format } }),
-        ...(temperature !== undefined && { temperature }),
-        ...(stop_sequences && { stop_sequences }),
-        ...(thinkingConfig && { thinking: thinkingConfig }),
-        ...(betas.length > 0 && { betas }),
-        metadata: getAPIMetadata(),
-      },
+      buildCreateParams(sendTemperature),
       { signal },
     )
   } catch (error) {
-    endTrace(
-      langfuseTrace,
-      { error: errorMessage(error) },
-      opts.optional ? 'interrupted' : 'error',
-    )
-    throw error
+    // Retry once without temperature when the model deprecated it, and
+    // remember the model so future calls skip temperature entirely.
+    if (sendTemperature && isTemperatureDeprecatedError(error)) {
+      temperatureUnsupportedModels.add(normalizedModel)
+      logForDebugging(
+        `[sideQuery] ${normalizedModel} rejected temperature (deprecated); retrying without it`,
+        { level: 'warn' },
+      )
+      try {
+        response = await client.beta.messages.create(buildCreateParams(false), {
+          signal,
+        })
+      } catch (retryError) {
+        endTrace(
+          langfuseTrace,
+          { error: errorMessage(retryError) },
+          opts.optional ? 'interrupted' : 'error',
+        )
+        throw retryError
+      }
+    } else {
+      endTrace(
+        langfuseTrace,
+        { error: errorMessage(error) },
+        opts.optional ? 'interrupted' : 'error',
+      )
+      throw error
+    }
   }
 
   const requestId =
