@@ -35,7 +35,7 @@ import { useMainLoopModel } from '../../hooks/useMainLoopModel.js';
 import { usePromptSuggestion } from '../../hooks/usePromptSuggestion.js';
 import { useTerminalSize } from '../../hooks/useTerminalSize.js';
 import { useTypeahead } from '../../hooks/useTypeahead.js';
-import { Box, type BorderTextOptions, type ClickEvent, type Key, stringWidth, Text, useInput } from '@anthropic/ink';
+import { Box, type ClickEvent, type Key, stringWidth, Text, useInput } from '@anthropic/ink';
 import { useOptionalKeybindingContext } from '../../keybindings/KeybindingContext.js';
 import { getShortcutDisplay } from '../../keybindings/shortcutFormat.js';
 import { useKeybinding, useKeybindings } from '../../keybindings/useKeybinding.js';
@@ -121,6 +121,7 @@ import TextInput from '../TextInput.js';
 import { ThinkingToggle } from '../ThinkingToggle.js';
 import { BackgroundTasksDialog } from '../tasks/BackgroundTasksDialog.js';
 import { shouldHideTasksFooter } from '../tasks/taskStatusUtils.js';
+import { ContextGaugeBorder } from './ContextGaugeBorder.js';
 import { TeamsDialog } from '../teams/TeamsDialog.js';
 import VimTextInput from '../VimTextInput.js';
 import { getModeFromInput, getValueFromInput } from './inputModes.js';
@@ -2496,26 +2497,35 @@ function PromptInput({
           <Text color={swarmBanner.bgColor}>{'─'.repeat(columns)}</Text>
         </>
       ) : (
-        <Box
-          flexDirection="row"
-          alignItems="flex-start"
-          justifyContent="flex-start"
-          borderColor={getBorderColor()}
-          borderStyle="round"
-          borderLeft={false}
-          borderRight={false}
-          borderBottom
-          width="100%"
-          borderText={buildBorderText(showFastIcon ?? false, showFastIconHint, fastModeCooldown)}
-        >
-          <PromptInputModeIndicator
-            mode={mode}
-            isLoading={isLoading}
-            viewingAgentName={viewingAgentName}
-            viewingAgentColor={viewingAgentColor}
+        <Box flexDirection="column" width="100%">
+          <ContextGaugeBorder
+            messages={messages}
+            model={mainLoopModel}
+            columns={columns - companionReservedColumns(columns, companionSpeaking)}
+            borderColor={getBorderColor()}
+            trailingText={buildFastIconText(showFastIcon ?? false, showFastIconHint, fastModeCooldown)}
           />
-          <Box flexGrow={1} flexShrink={1} onClick={handleInputClick}>
-            {textInputElement}
+          <Box
+            flexDirection="row"
+            alignItems="flex-start"
+            justifyContent="flex-start"
+            borderColor={getBorderColor()}
+            borderStyle="round"
+            borderTop={false}
+            borderLeft={false}
+            borderRight={false}
+            borderBottom
+            width="100%"
+          >
+            <PromptInputModeIndicator
+              mode={mode}
+              isLoading={isLoading}
+              viewingAgentName={viewingAgentName}
+              viewingAgentColor={viewingAgentColor}
+            />
+            <Box flexGrow={1} flexShrink={1} onClick={handleInputClick}>
+              {textInputElement}
+            </Box>
           </Box>
         </Box>
       )}
@@ -2630,21 +2640,17 @@ function getInitialPasteId(messages: Message[]): number {
   return maxId + 1;
 }
 
-function buildBorderText(
+/** Fast-mode icon (plus `/fast` hint) pinned to the right of the context gauge border. */
+function buildFastIconText(
   showFastIcon: boolean,
   showFastIconHint: boolean,
   fastModeCooldown: boolean,
-): BorderTextOptions | undefined {
+): string | undefined {
   if (!showFastIcon) return undefined;
   const fastSeg = showFastIconHint
     ? `${getFastIconString(true, fastModeCooldown)} ${chalk.dim('/fast')}`
     : getFastIconString(true, fastModeCooldown);
-  return {
-    content: ` ${fastSeg} `,
-    position: 'top',
-    align: 'end',
-    offset: 0,
-  };
+  return ` ${fastSeg} `;
 }
 
 export default React.memo(PromptInput);

@@ -189,31 +189,12 @@ export function isAutoCompactEnabled(): boolean {
   return userConfig.autoCompactEnabled
 }
 
-export async function shouldAutoCompact(
-  messages: Message[],
-  model: string,
-  querySource?: QuerySource,
-  // Snip removes messages but the surviving assistant's usage still reflects
-  // pre-snip context, so tokenCountWithEstimation can't see the savings.
-  // Subtract the rough-delta that snip already computed.
-  snipTokensFreed = 0,
-): Promise<boolean> {
-  // Recursion guards. session_memory and compact are forked agents that
-  // would deadlock.
-  if (querySource === 'session_memory' || querySource === 'compact') {
-    return false
-  }
-  // marble_origami is the ctx-agent — if ITS context blows up and
-  // autocompact fires, runPostCompactCleanup calls resetContextCollapse()
-  // which destroys the MAIN thread's committed log (module-level state
-  // shared across forks). Inside feature() so the string DCEs from
-  // external builds (it's in excluded-strings.txt).
-  if (feature('CONTEXT_COLLAPSE')) {
-    if (querySource === 'marble_origami') {
-      return false
-    }
-  }
-
+/**
+ * Whether proactive autocompact fires at {@link getAutoCompactThreshold}.
+ * False when disabled, or when reactive-only / context-collapse mode owns
+ * context management instead.
+ */
+export function isProactiveAutoCompactActive(): boolean {
   if (!isAutoCompactEnabled()) {
     return false
   }
@@ -252,6 +233,38 @@ export async function shouldAutoCompact(
     if (isContextCollapseEnabled()) {
       return false
     }
+  }
+
+  return true
+}
+
+export async function shouldAutoCompact(
+  messages: Message[],
+  model: string,
+  querySource?: QuerySource,
+  // Snip removes messages but the surviving assistant's usage still reflects
+  // pre-snip context, so tokenCountWithEstimation can't see the savings.
+  // Subtract the rough-delta that snip already computed.
+  snipTokensFreed = 0,
+): Promise<boolean> {
+  // Recursion guards. session_memory and compact are forked agents that
+  // would deadlock.
+  if (querySource === 'session_memory' || querySource === 'compact') {
+    return false
+  }
+  // marble_origami is the ctx-agent — if ITS context blows up and
+  // autocompact fires, runPostCompactCleanup calls resetContextCollapse()
+  // which destroys the MAIN thread's committed log (module-level state
+  // shared across forks). Inside feature() so the string DCEs from
+  // external builds (it's in excluded-strings.txt).
+  if (feature('CONTEXT_COLLAPSE')) {
+    if (querySource === 'marble_origami') {
+      return false
+    }
+  }
+
+  if (!isProactiveAutoCompactActive()) {
+    return false
   }
 
   const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
