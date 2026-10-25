@@ -11,11 +11,11 @@
 ```
 hasAgentTool
   && feature('VERIFICATION_AGENT')
-  && getFeatureValue_CACHED_MAY_BE_STALE('tengu_hive_evidence', false)  // 3P 默认 false，ant-only A/B
+  && getFeatureValue_CACHED_MAY_BE_STALE('tengu_hive_evidence', false)  // 本 fork 的 LOCAL_GATE_DEFAULTS 强制为 true
   && !isPoorModeActive()                                                // /poor 整段关闭
 ```
 
-**改动 1（已落地）** 把契约里的触发判据从"3+ 文件"这种粗计数改成风险导向（机械/replay 类改动 precheck 绿则跳过；净新增逻辑/后端/安全才验），并要求"真要验时给窄简报、别重跑全套"。
+**改动 1（已落地）** 把契约里的触发判据从"3+ 文件"这种粗计数改成风险导向（后端/API、安全/鉴权、基础设施/配置改动无论来源——cherry-pick、生成代码、replay——一律要验；其余机械/replay 类改动在本轮 build 与测试已通过时可跳过；净新增逻辑也要验），并要求 spawn 时把简报聚焦到具体风险点（不再让主代理告诉校验器"build/测试已跑过、别重跑"，校验器仍按自身基线独立跑 build/测试）。
 
 **本设置（改动 3）** 在此之上再提供一个比 `/poor` 更细的**显式总档位**，让维护者按 project / 场景固定校验策略。
 
@@ -42,5 +42,5 @@ hasAgentTool
 
 ## 依赖 / 注意
 
-- 契约仅在 `tengu_hive_evidence` A/B 门控解析为 `true` 时才注入；该 gate 若关闭，本设置也无从生效。
+- 契约仅在 `tengu_hive_evidence` 门控解析为 `true` 时才注入。上游这是 ant-only A/B（3P 默认 false）；但本 fork 在 `src/services/analytics/growthbook.ts` 的 `LOCAL_GATE_DEFAULTS` 中把它强制为 `true`，因此只要 `VERIFICATION_AGENT` 编译开启且有 Agent 工具，契约默认就会注入，唯一例外是 `/poor` 模式。
 - 与 `/poor` 的关系：`/poor` 是"省 token 总闸"（同时跳过 extract_memories、prompt_suggestion、verification 等）；本设置只管 verification 一项，粒度更细、可正交组合。

@@ -129,7 +129,7 @@ Use the literal string \`VERDICT: \` followed by exactly one of \`PASS\`, \`FAIL
 - **PARTIAL**: what was verified, what could not be and why (missing tool/env), what the implementer should know.`
 
 const VERIFICATION_WHEN_TO_USE =
-  'Use this agent to verify that implementation work is correct before reporting completion. Invoke after non-trivial tasks (3+ file edits, backend/API changes, infrastructure changes). Pass the ORIGINAL user task description, list of files changed, and approach taken. The agent runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL verdict with evidence.'
+  'Use this agent to verify that implementation work is correct before reporting completion. Invoke after non-trivial changes: net-new logic, backend/API changes, security-sensitive code (auth, permissions, secrets), or infrastructure/config changes — the last three always, even when they come from a cherry-pick, generated code, or a replay. Purely mechanical changes (clean cherry-pick, rename, version bump, doc/string edit) whose build and tests already passed do not need it. Pass the ORIGINAL user task description, list of files changed, approach taken, and the specific risk areas to focus on. The agent runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL verdict with evidence.'
 
 export const VERIFICATION_AGENT: BuiltInAgentDefinition = {
   agentType: 'verification',
