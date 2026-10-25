@@ -20,18 +20,30 @@ type Props = {
   borderColor: keyof Theme;
   /** Pre-rendered text pinned one cell from the right edge (e.g. the fast-mode icon). */
   trailingText?: string;
+  /**
+   * False while viewing a subagent/teammate: `messages`/`model` are the leader's,
+   * so the gauge draws a plain rule instead of misreporting the viewed agent's context.
+   */
+  showUsage: boolean;
 };
 
 /**
  * Prompt box top border doubling as a context-window gauge:
  * `▶───3%──────────┃──────1M─` — fill = context used, `┃` = auto-compact trigger.
  */
-export function ContextGaugeBorder({ messages, model, columns, borderColor, trailingText }: Props): React.ReactNode {
+export function ContextGaugeBorder({
+  messages,
+  model,
+  columns,
+  borderColor,
+  trailingText,
+  showUsage,
+}: Props): React.ReactNode {
   const tokenUsage = useMemo(
     () => tokenCountFromLastAPIResponse(getMessagesAfterCompactBoundary(messages)),
     [messages],
   );
-  const contextWindow = getContextWindowForModel(model, getSdkBetas());
+  const contextWindow = showUsage ? getContextWindowForModel(model, getSdkBetas()) : 0;
   const thresholdPercent =
     contextWindow > 0 && isProactiveAutoCompactActive() ? (getAutoCompactThreshold(model) / contextWindow) * 100 : null;
 

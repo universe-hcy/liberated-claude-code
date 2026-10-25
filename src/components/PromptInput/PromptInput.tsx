@@ -2504,6 +2504,7 @@ function PromptInput({
             columns={columns - companionReservedColumns(columns, companionSpeaking)}
             borderColor={getBorderColor()}
             trailingText={buildFastIconText(showFastIcon ?? false, showFastIconHint, fastModeCooldown)}
+            showUsage={!viewingAgentTaskId}
           />
           <Box
             flexDirection="row"
