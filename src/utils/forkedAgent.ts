@@ -443,7 +443,6 @@ export function createSubagentContext(
     openMessageSelector: undefined,
     pushContextMark: undefined,
     applyPop: undefined,
-    retainPushMarkersFrom: undefined,
     askCompactStrategy: undefined,
 
     // Fields that can be overridden or copied from parent

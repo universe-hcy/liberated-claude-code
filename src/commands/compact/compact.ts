@@ -7,6 +7,7 @@ import { getSystemContext, getUserContext } from '../../context.js'
 import { getShortcutDisplay } from '../../keybindings/shortcutFormat.js'
 import { notifyCompaction } from '../../services/api/promptCacheBreakDetection.js'
 import {
+  buildPostCompactMessages,
   type CompactionResult,
   compactConversation,
   ERROR_MESSAGE_INCOMPLETE_RESPONSE,
@@ -19,6 +20,7 @@ import { microcompactMessages } from '../../services/compact/microCompact.js'
 import { runPostCompactCleanup } from '../../services/compact/postCompactCleanup.js'
 import { trySessionMemoryCompaction } from '../../services/compact/sessionMemoryCompact.js'
 import { setLastSummarizedMessageId } from '../../services/SessionMemory/sessionMemoryUtils.js'
+import { prunePushMarkersAfterCompaction } from '../../services/pushStack/state.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { LocalCommandCall } from '../../types/command.js'
 import type { Message } from '../../types/message.js'
@@ -40,6 +42,24 @@ const reactiveCompact = feature('REACTIVE_COMPACT')
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 export const call: LocalCommandCall = async (args, context) => {
+  const result = await compactMessagesForCommand(args, context)
+  // Push points whose anchor was summarized away (all of them for a full
+  // compaction) leave the stack now, after success, with a notification.
+  prunePushMarkersAfterCompaction(
+    context,
+    buildPostCompactMessages(result.compactionResult),
+  )
+  return result
+}
+
+async function compactMessagesForCommand(
+  args: string,
+  context: Parameters<LocalCommandCall>[1],
+): Promise<{
+  type: 'compact'
+  compactionResult: CompactionResult
+  displayText: string
+}> {
   const { abortController } = context
   let { messages } = context
 

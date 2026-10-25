@@ -85,6 +85,9 @@ export function MessageSelector({
   const fileHistory = useAppState(s => s.fileHistory);
   const [error, setError] = useState<string | undefined>(undefined);
   const isFileHistoryEnabled = fileHistoryEnabled();
+  // /digest never touches files: skip all code-restore state (diff stats,
+  // per-item file changes, restore warnings) so nothing implies a rewind.
+  const showCodeState = isFileHistoryEnabled && mode !== 'digest';
 
   // Add current prompt as a virtual message
   const currentUUID = useMemo(randomUUID, []);
@@ -114,7 +117,7 @@ export function MessageSelector({
   const [diffStatsForRestore, setDiffStatsForRestore] = useState<DiffStats | undefined>(undefined);
 
   useEffect(() => {
-    if (!preselectedMessage || !isFileHistoryEnabled) return;
+    if (!preselectedMessage || !showCodeState) return;
     let cancelled = false;
     void fileHistoryGetDiffStats(fileHistory, preselectedMessage.uuid).then(stats => {
       if (!cancelled) setDiffStatsForRestore(stats);
@@ -122,7 +125,7 @@ export function MessageSelector({
     return () => {
       cancelled = true;
     };
-  }, [preselectedMessage, isFileHistoryEnabled, fileHistory]);
+  }, [preselectedMessage, showCodeState, fileHistory]);
 
   const [isRestoring, setIsRestoring] = useState(false);
   const [restoringOption, setRestoringOption] = useState<RestoreOption | null>(null);
@@ -213,6 +216,13 @@ export function MessageSelector({
     // Do nothing if the message is not found
     if (!messages.includes(message)) {
       onClose();
+      return;
+    }
+
+    // Digest always lands on its own confirmation (Distill / Never mind) and
+    // must never fall through to the rewind-without-confirmation path.
+    if (mode === 'digest') {
+      setMessageToRestore(message);
       return;
     }
 
@@ -355,7 +365,7 @@ export function MessageSelector({
 
   useEffect(() => {
     async function loadFileHistoryMetadata() {
-      if (!isFileHistoryEnabled) {
+      if (!showCodeState) {
         return;
       }
       // Load file snapshot metadata
@@ -389,10 +399,10 @@ export function MessageSelector({
       );
     }
     void loadFileHistoryMetadata();
-  }, [messageOptions, messages, currentUUID, fileHistory, isFileHistoryEnabled]);
+  }, [messageOptions, messages, currentUUID, fileHistory, showCodeState]);
 
   const canRestoreCode =
-    isFileHistoryEnabled && diffStatsForRestore?.filesChanged && diffStatsForRestore.filesChanged.length > 0;
+    showCodeState && diffStatsForRestore?.filesChanged && diffStatsForRestore.filesChanged.length > 0;
   const showPickList = !error && !messageToRestore && !preselectedMessage && hasMessagesToSelect;
 
   return (
@@ -410,7 +420,7 @@ export function MessageSelector({
         )}
         {!hasMessagesToSelect && (
           <>
-            <Text>Nothing to rewind to yet.</Text>
+            <Text>{mode === 'digest' ? 'Nothing to distill yet.' : 'Nothing to rewind to yet.'}</Text>
           </>
         )}
         {!error && messageToRestore && hasMessagesToSelect && (
@@ -440,21 +450,27 @@ export function MessageSelector({
                 ({formatRelativeTimeAgo(new Date(messageToRestore.timestamp as string | number | Date))})
               </Text>
             </Box>
-            <RestoreOptionDescription
-              selectedRestoreOption={selectedRestoreOption}
-              canRestoreCode={!!canRestoreCode}
-              diffStatsForRestore={diffStatsForRestore}
-            />
+            {mode === 'digest' ? (
+              <Text dimColor>
+                This message and everything after it will be replaced by a digest. Files are not touched.
+              </Text>
+            ) : (
+              <RestoreOptionDescription
+                selectedRestoreOption={selectedRestoreOption}
+                canRestoreCode={!!canRestoreCode}
+                diffStatsForRestore={diffStatsForRestore}
+              />
+            )}
             {isRestoring && isSummarizeOption(restoringOption) ? (
               <Box flexDirection="row" gap={1}>
                 <Spinner />
-                <Text>Summarizing…</Text>
+                <Text>{mode === 'digest' ? 'Distilling…' : 'Summarizing…'}</Text>
               </Box>
             ) : (
               <Select
                 isDisabled={isRestoring}
                 options={getRestoreOptions(!!canRestoreCode)}
-                defaultFocusValue={canRestoreCode ? 'both' : 'conversation'}
+                defaultFocusValue={mode === 'digest' ? 'summarize' : canRestoreCode ? 'both' : 'conversation'}
                 onFocus={value => setSelectedRestoreOption(value as RestoreOption)}
                 onChange={value => onSelectRestoreOption(value as RestoreOption)}
                 onCancel={() => (preselectedMessage ? onClose() : setMessageToRestore(undefined))}
@@ -491,7 +507,7 @@ export function MessageSelector({
                   return (
                     <Box
                       key={msg.uuid}
-                      height={isFileHistoryEnabled ? 3 : 2}
+                      height={showCodeState ? 3 : 2}
                       overflow="hidden"
                       width="100%"
                       flexDirection="row"
@@ -514,7 +530,7 @@ export function MessageSelector({
                             paddingRight={10}
                           />
                         </Box>
-                        {isFileHistoryEnabled && metadataLoaded && (
+                        {showCodeState && metadataLoaded && (
                           <Box height={1} flexDirection="row">
                             {metadata ? (
                               <>

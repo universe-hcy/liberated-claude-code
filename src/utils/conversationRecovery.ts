@@ -12,6 +12,7 @@ import type {
   PersistedWorktreeSession,
   SerializedMessage,
 } from '../types/logs.js'
+import type { PushMarker } from '../services/pushStack/state.js'
 import type {
   Message,
   NormalizedMessage,
@@ -509,6 +510,8 @@ export async function loadConversationForResume(
   fullPath?: string
   // Goal state for hydration on resume
   goal?: import('../types/logs.js').GoalState
+  // Push/pop context stack (projected onto messages by the resume caller)
+  pushStack?: PushMarker[]
 } | null> {
   try {
     let log: LogOption | null = null
@@ -622,6 +625,7 @@ export async function loadConversationForResume(
       fullPath: log?.fullPath,
       // Goal state for hydration on resume
       goal: log?.goal,
+      pushStack: log?.pushStack,
     }
   } catch (error) {
     logError(error as Error)

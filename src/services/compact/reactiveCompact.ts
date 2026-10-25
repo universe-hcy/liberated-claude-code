@@ -4,10 +4,15 @@ import {
   isPromptTooLongMessage,
 } from '../api/errors.js'
 import type { AssistantMessage, Message } from '../../types/message.js'
-import { type CompactionResult, compactConversation } from './compact.js'
+import {
+  buildPostCompactMessages,
+  type CompactionResult,
+  compactConversation,
+} from './compact.js'
 import { logError } from '../../utils/log.js'
 import { logForDebugging } from '../../utils/debug.js'
 import type { CacheSafeParams } from '../../utils/forkedAgent.js'
+import { prunePushMarkersAfterCompaction } from '../pushStack/state.js'
 
 export const isReactiveOnlyMode: () => boolean = () => false
 
@@ -84,6 +89,11 @@ export const tryReactiveCompact: (params: {
         turnsSincePreviousCompact: 0,
         autoCompactThreshold: 0,
       },
+    )
+    // Full compaction: drop push points whose anchor was summarized away.
+    prunePushMarkersAfterCompaction(
+      params.toolUseContext,
+      buildPostCompactMessages(result),
     )
     return result
   } catch (error) {

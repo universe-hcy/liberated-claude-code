@@ -1,3 +1,5 @@
+import type { Message } from '../../types/message.js'
+
 // Context-bleed / degradation guard.
 //
 // When the model regurgitates a whole internal <system-reminder> block as its
@@ -21,10 +23,13 @@
 // body-fingerprint requirement:
 //
 //   1. Length gate — regurgitation is a long-context phenomenon. Skip entirely
-//      until the session is long enough (messageCount >= MIN_MESSAGES).
+//      until the live (post-compact-boundary) context is large enough
+//      (contextTokens >= MIN_CONTEXT_TOKENS_FOR_DEGRADATION).
 //   2. Meta-discussion exclusion — if the prose *outside* the block talks about
 //      this mechanism (names the guard, "回吐"/"误报", "例如"/"for example"…),
-//      it's an intentional quote, not a bleed.
+//      it's an intentional quote, not a bleed. Matched on the original text
+//      (only reminder blocks removed): identifiers like `detectContextBleed`
+//      are almost always backticked, so code stripping must not hide them.
 //   3. Position / symptom constraint — only fire when the block essentially *is*
 //      the whole output (nothing but the block), or the surrounding prose carries
 //      the degradation's own hallucination symptoms ("文件被污染", "工具未执行",
@@ -35,17 +40,75 @@ const SYSTEM_REMINDER_OPEN = '<system-reminder>'
 // Matches a fully closed reminder block; capture group 1 is the body.
 const CLOSED_REMINDER_BLOCK = /<system-reminder>([\s\S]*?)<\/system-reminder>/gi
 
-// Markdown code — fenced (```…```) first, then inline (`…`). A reminder block
-// quoted as a code example is documentation, never a bleed, so we blank code
-// out (to a space) before any detection runs. Honours this file's stated
-// guarantee that code references must not trip the guard.
-const FENCED_CODE = /```[\s\S]*?```/g
-const INLINE_CODE = /`[^`]*`/g
+// Markdown code. A reminder block quoted as a code example is documentation,
+// never a bleed, so code is blanked out before fingerprint matching and the
+// outside-prose emptiness/symptom checks. Parsed line by line (CommonMark
+// subset) because a lazy regex mis-pairs nested fences and lets a stray
+// backtick swallow real prose across lines.
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/
+const INDENTED_CODE_LINE = /^(?: {4}|\t)/
+const BLOCKQUOTE_LINE = /^ {0,3}>/
+const INLINE_CODE = /`[^`\n]+`/g
 
-/** Replaces Markdown code spans/fences with a space so quoted reminders in code
- * examples can't match the fingerprint or affect the outside-prose analysis. */
-function stripCodeSpans(text: string): string {
-  return text.replace(FENCED_CODE, ' ').replace(INLINE_CODE, ' ')
+/**
+ * Blanks Markdown code (and quotes) so reminders quoted there can't match the
+ * fingerprint or affect the outside-prose analysis:
+ *  - fenced blocks: ``` or ~~~ (3+), up to 3 leading spaces; the closer must use
+ *    the same char and be at least as long; an unclosed fence (e.g. output cut
+ *    by max_tokens) runs to the end of the text;
+ *  - indented code: 4-space/tab lines that start after a blank line (they can't
+ *    interrupt a paragraph, so an indented body line inside a regurgitated
+ *    block stays visible);
+ *  - `>` blockquote lines: quoting is by definition intentional, and a real
+ *    regurgitation is never `>`-prefixed — consistent with the bias toward
+ *    missing over nagging;
+ *  - inline code spans, never across a newline.
+ */
+export function stripMarkdownCode(text: string): string {
+  const out: string[] = []
+  let fence: { char: string; length: number } | null = null
+  let inIndentedCode = false
+  let prevBlank = true
+  for (const line of text.split('\n')) {
+    if (fence) {
+      const close = FENCE_CLOSE.exec(line)
+      if (
+        close &&
+        close[1][0] === fence.char &&
+        close[1].length >= fence.length
+      ) {
+        fence = null
+        prevBlank = true
+      }
+      out.push('')
+      continue
+    }
+    const open = FENCE_OPEN.exec(line)
+    // A backtick fence's info string may not contain backticks (CommonMark),
+    // so "```x```" on one line is inline code, not an opener.
+    if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
+      fence = { char: open[1][0], length: open[1].length }
+      inIndentedCode = false
+      out.push('')
+      continue
+    }
+    if (line.trim() === '') {
+      prevBlank = true
+      out.push(line)
+      continue
+    }
+    if (INDENTED_CODE_LINE.test(line) && (inIndentedCode || prevBlank)) {
+      inIndentedCode = true
+      prevBlank = false
+      out.push('')
+      continue
+    }
+    inIndentedCode = false
+    prevBlank = false
+    out.push(BLOCKQUOTE_LINE.test(line) ? '' : line.replace(INLINE_CODE, ' '))
+  }
+  return out.join('\n')
 }
 
 // Body-text fingerprints that appear *inside* harness-generated reminders
@@ -64,10 +127,15 @@ const REMINDER_BODY_FINGERPRINTS = [
   /not sent by the user/i,
 ]
 
-// Layer 1: regurgitation only shows up deep into a long context. Below this many
-// messages a closed reminder block is almost certainly an intentional quote, so
-// we don't even look. Bias toward missing over nagging.
-const MIN_MESSAGES_FOR_DEGRADATION = 50
+// Layer 1: regurgitation only shows up deep into a long context (the 2026-07-27
+// sample was a many-hour session). Measured in tokens of the live context —
+// what the model actually attends to after the last compaction — not message
+// count: every content block, tool_result and local notice is its own message,
+// and pre-compact history stays in the REPL array. 100k is half a standard
+// 200k window: short teaching/quoting sessions never get there, while the
+// sessions where inference-side degradation was observed are well past it.
+// Bias toward missing over nagging.
+const MIN_CONTEXT_TOKENS_FOR_DEGRADATION = 100_000
 
 // Layer 2: prose outside the block that discusses/teaches this very mechanism.
 // Its presence marks the block as an intentional quote (illustration, transcript
@@ -96,30 +164,30 @@ const CONTEXT_BLEED_NOTICE =
  * Layered to avoid false alarms in a repo that constantly quotes real reminders:
  *  - requires a closed <system-reminder>…</system-reminder> block whose body
  *    matches a harness fingerprint;
- *  - `messageCount`, when provided, gates out short sessions (degradation is a
- *    long-context phenomenon);
+ *  - `contextTokens` (live post-compact context size), when provided, gates
+ *    out short contexts (degradation is a long-context phenomenon);
  *  - prose outside the block that discusses the mechanism → treated as a quote;
  *  - fires only when the block is essentially the entire output, or the outside
  *    prose carries the degradation's hallucination symptoms.
  */
 export function detectContextBleed(
   assistantText: string | null,
-  messageCount?: number,
+  contextTokens?: number,
 ): string | null {
   if (!assistantText) {
     return null
   }
-  // Blank out Markdown code spans/fences first: a reminder block quoted as a
-  // code example is documentation, not a bleed. All analysis below runs on this
-  // scannable copy so code-quoted reminders can't match or skew the outside prose.
-  const scannable = stripCodeSpans(assistantText)
+  // Blank out Markdown code first: a reminder block quoted as a code example is
+  // documentation, not a bleed. Fingerprint matching and the outside-prose
+  // emptiness/symptom checks run on this copy.
+  const scannable = stripMarkdownCode(assistantText)
   if (!scannable.includes(SYSTEM_REMINDER_OPEN)) {
     return null
   }
-  // Layer 1: length gate — don't even look at short sessions.
+  // Layer 1: length gate — don't even look at short contexts.
   if (
-    typeof messageCount === 'number' &&
-    messageCount < MIN_MESSAGES_FOR_DEGRADATION
+    typeof contextTokens === 'number' &&
+    contextTokens < MIN_CONTEXT_TOKENS_FOR_DEGRADATION
   ) {
     return null
   }
@@ -134,16 +202,69 @@ export function detectContextBleed(
   if (!hasFingerprintedBlock) {
     return null
   }
-  // Prose left after stripping every closed block.
-  const outside = scannable.replace(CLOSED_REMINDER_BLOCK, ' ')
-  // Layer 2: outside prose discusses the mechanism → intentional quote.
-  if (META_DISCUSSION.test(outside)) {
+  // Layer 2: outside prose discusses the mechanism → intentional quote. Uses
+  // the original text so backticked identifiers still count as discussion.
+  if (META_DISCUSSION.test(assistantText.replace(CLOSED_REMINDER_BLOCK, ' '))) {
     return null
   }
   // Layer 3: fire only if the block is essentially the whole output, or the
-  // surrounding prose shows the degradation's hallucination symptoms.
+  // surrounding (non-code) prose shows the degradation's hallucination symptoms.
+  const outside = scannable.replace(CLOSED_REMINDER_BLOCK, ' ')
   if (outside.trim().length === 0 || HALLUCINATION_SYMPTOMS.test(outside)) {
     return CONTEXT_BLEED_NOTICE
+  }
+  return null
+}
+
+/**
+ * Joins the text blocks of each assistant API response in `turnMessages` (the
+ * messages a turn appended). A response streams as one message per content
+ * block, so blocks are grouped by API message id: each group is one model
+ * utterance and is judged on its own, like a single assistant reply.
+ */
+export function collectAssistantResponseTexts(
+  turnMessages: readonly Message[],
+): string[] {
+  const byResponse = new Map<string, string[]>()
+  for (const message of turnMessages) {
+    if (message.type !== 'assistant') {
+      continue
+    }
+    const content = message.message?.content
+    if (!Array.isArray(content)) {
+      continue
+    }
+    const texts = (content as Array<{ type: string; text?: string }>)
+      .filter(block => block.type === 'text' && block.text)
+      .map(block => block.text as string)
+    if (texts.length === 0) {
+      continue
+    }
+    const key = message.message?.id ?? message.uuid
+    const group = byResponse.get(key)
+    if (group) {
+      group.push(...texts)
+    } else {
+      byResponse.set(key, texts)
+    }
+  }
+  return [...byResponse.values()].map(texts => texts.join('\n'))
+}
+
+/**
+ * Runs `detectContextBleed` over every assistant response the turn produced,
+ * not only the last block: a regurgitation followed by a tool retry (the real
+ * 2026-07-27 shape) leaves a tool_use as the turn's final block.
+ */
+export function detectContextBleedInTurn(
+  turnMessages: readonly Message[],
+  contextTokens?: number,
+): string | null {
+  for (const text of collectAssistantResponseTexts(turnMessages)) {
+    const notice = detectContextBleed(text, contextTokens)
+    if (notice) {
+      return notice
+    }
   }
   return null
 }

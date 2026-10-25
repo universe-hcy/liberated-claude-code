@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import type { Task } from '../../../utils/tasks.js'
+import type { AppState } from '../../../state/AppState.js'
 import {
   buildContinuationPrompt,
   buildUnfinishedTaskNotice,
+  getMainThreadTaskOwners,
+  selectActionableTasks,
+  taskReminderKey,
 } from '../taskAnchorReminder.js'
 
 function task(partial: Partial<Task> & Pick<Task, 'id' | 'status'>): Task {
@@ -88,5 +92,80 @@ describe('buildUnfinishedTaskNotice', () => {
     ])!
     expect(notice).toContain('按 Tab')
     expect(notice).not.toContain('可直接回车继续')
+  })
+})
+
+describe('selectActionableTasks', () => {
+  const self = new Set(['team-lead'])
+
+  test('drops completed tasks and tasks owned by other agents', () => {
+    const picked = selectActionableTasks(
+      [
+        task({ id: '1', status: 'in_progress', owner: 'researcher' }),
+        task({ id: '2', status: 'in_progress', owner: 'team-lead' }),
+        task({ id: '3', status: 'pending' }),
+        task({ id: '4', status: 'completed' }),
+      ],
+      self,
+    )
+    expect(picked.map(t => t.id)).toEqual(['2', '3'])
+  })
+
+  test('skips pending tasks whose blockers are not all completed', () => {
+    const picked = selectActionableTasks(
+      [
+        task({ id: '1', status: 'completed' }),
+        task({ id: '2', status: 'in_progress', owner: 'researcher' }),
+        task({ id: '3', status: 'pending', blockedBy: ['1'] }),
+        task({ id: '4', status: 'pending', blockedBy: ['1', '2'] }),
+        task({ id: '5', status: 'pending', blockedBy: ['gone'] }),
+      ],
+      self,
+    )
+    expect(picked.map(t => t.id)).toEqual(['3', '5'])
+  })
+
+  test('a continuation never targets another teammate’s task', () => {
+    const picked = selectActionableTasks(
+      [
+        task({ id: '1', status: 'in_progress', owner: 'researcher' }),
+        task({ id: '2', status: 'pending', subject: 'mine' }),
+      ],
+      self,
+    )
+    expect(buildContinuationPrompt(picked)).toBe('按计划继续 Task #2 mine')
+    expect(buildUnfinishedTaskNotice(picked)).toBeNull()
+  })
+})
+
+describe('getMainThreadTaskOwners', () => {
+  test('is empty outside a team', () => {
+    expect(getMainThreadTaskOwners(undefined).size).toBe(0)
+  })
+
+  test('includes the lead identities when this session leads the team', () => {
+    const teamContext = {
+      teamName: 't',
+      teamFilePath: '/tmp/t.json',
+      leadAgentId: 'team-lead@t',
+      teammates: {},
+    } satisfies NonNullable<AppState['teamContext']>
+    const owners = getMainThreadTaskOwners(teamContext)
+    expect(owners.has('team-lead')).toBe(true)
+    expect(owners.has('team-lead@t')).toBe(true)
+  })
+})
+
+describe('taskReminderKey', () => {
+  test('is stable across ordering and changes with status or task set', () => {
+    const a = task({ id: '1', status: 'in_progress' })
+    const b = task({ id: '2', status: 'pending' })
+    const key = taskReminderKey('list', [a, b])
+    expect(taskReminderKey('list', [b, a])).toBe(key)
+    expect(
+      taskReminderKey('list', [a, { ...b, status: 'in_progress' }]),
+    ).not.toBe(key)
+    expect(taskReminderKey('list', [a])).not.toBe(key)
+    expect(taskReminderKey('other', [a, b])).not.toBe(key)
   })
 })

@@ -19,7 +19,8 @@ function parseMarkerOrdinal(raw: string): number | null {
  * Parses `/pop` flags into PopOptions. Recognized:
  *   --to #N | --to N   cross-layer pop back to marker ordinal N (§4.7)
  *   --discard          truncate without generating a digest
- *   --keep-code        truncate conversation but skip file rollback
+ *   --keep-code        don't report the branch's file changes afterwards
+ *                      (files are never rolled back automatically)
  * Returns a string on parse error.
  */
 export function parsePopArgs(args: string): PopOptions | string {
@@ -81,6 +82,9 @@ export async function call(
     }
   }
 
-  context.applyPop(parsed)
+  // Awaited (not fire-and-forget): the digest then runs inside this command's
+  // queryGuard reservation, so prompts typed meanwhile are queued instead of
+  // being overwritten by the post-digest message swap, and Esc cancels it.
+  await context.applyPop(parsed, context.abortController)
   return { type: 'skip' }
 }

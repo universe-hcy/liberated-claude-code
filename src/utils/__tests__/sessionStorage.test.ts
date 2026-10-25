@@ -149,6 +149,42 @@ describe('push-stack transcript round-trip', () => {
     const stack = pushStacks.get(asUuid(sessionId))
     expect(stack).toEqual([])
   })
+
+  test('a pre-boundary push-stack entry survives the >5MB precompact skip', async () => {
+    const sessionId = 'session-large'
+    const filePath = sessionFilePath(sessionId)
+    // Filler pushes the file past SKIP_PRECOMPACT_THRESHOLD (5MB) so the
+    // loader truncates everything before the boundary and only recovers
+    // pre-boundary lines whose type is in METADATA_TYPE_MARKERS.
+    const filler = JSON.stringify({
+      type: 'user',
+      uuid: '00000000-0000-0000-0000-0000000000f1',
+      parentUuid: null,
+      sessionId,
+      message: { role: 'user', content: 'x'.repeat(6 * 1024 * 1024) },
+    })
+    const boundary = JSON.stringify({
+      parentUuid: null,
+      type: 'system',
+      subtype: 'compact_boundary',
+      uuid: '00000000-0000-0000-0000-0000000000b1',
+      timestamp: new Date().toISOString(),
+      sessionId,
+      content: 'Conversation compacted',
+      compactMetadata: { trigger: 'auto', preTokens: 0 },
+    })
+    writeFileSync(
+      filePath,
+      [
+        pushStackLine(sessionId, [marker('pre', '000000000001')]),
+        filler,
+        boundary,
+      ].join('\n') + '\n',
+    )
+
+    const { pushStacks } = await loadTranscriptFile(filePath)
+    expect(pushStacks.get(asUuid(sessionId))?.map(m => m.id)).toEqual(['pre'])
+  })
 })
 
 describe('getSessionMessages bounded cache (memory leak fix)', () => {

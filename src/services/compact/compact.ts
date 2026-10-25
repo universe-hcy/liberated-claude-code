@@ -127,14 +127,43 @@ import {
 /**
  * Optional knobs for partialCompactConversation. Additive: omitting the bag
  * preserves the exact prior behavior (used by the message-selector onSummarize
- * path). The push/pop feature passes both to render a four-column digest with
- * side-branch framing instead of the generic "ran out of context" summary.
+ * path). The push/pop feature passes promptOverride + summaryFraming to render
+ * a four-column digest with side-branch framing instead of the generic "ran out
+ * of context" summary, and trigger 'auto' from the stack-aware auto-compact.
  */
 export type PartialCompactOptions = {
   /** Replaces the base instruction template in getPartialCompactPrompt. */
   promptOverride?: string
   /** 'digest' swaps the summary wrapper for side-branch framing; default 'compact'. */
   summaryFraming?: 'compact' | 'digest'
+  /** Hook / boundary / analytics trigger; default 'manual' (message selector). */
+  trigger?: 'manual' | 'auto'
+}
+
+/**
+ * Messages a partial 'up_to' compaction keeps from the pivot onward. Old
+ * compact boundaries must go: summary_B sits BEFORE kept, so a stale boundary_A
+ * in kept would win findLastCompactBoundaryIndex's backward scan and drop
+ * summary_B. Plain compact summaries go with them, but digests (`/pop`,
+ * `/digest`) are the only record of a closed discussion branch and nothing
+ * else covers them, so they stay.
+ */
+export function selectUpToMessagesToKeep(
+  allMessages: readonly Message[],
+  pivotIndex: number,
+): Message[] {
+  return allMessages
+    .slice(pivotIndex)
+    .filter(
+      m =>
+        m.type !== 'progress' &&
+        !isCompactBoundaryMessage(m) &&
+        !(
+          m.type === 'user' &&
+          m.isCompactSummary &&
+          m.isDigestSummary !== true
+        ),
+    )
 }
 
 export const POST_COMPACT_MAX_FILES_TO_RESTORE = 5
@@ -826,22 +855,14 @@ export async function partialCompactConversation(
       direction === 'up_to'
         ? allMessages.slice(0, pivotIndex)
         : allMessages.slice(pivotIndex)
-    // 'up_to' must strip old compact boundaries/summaries: for 'up_to',
-    // summary_B sits BEFORE kept, so a stale boundary_A in kept wins
-    // findLastCompactBoundaryIndex's backward scan and drops summary_B.
+    // 'up_to' strips old compact boundaries (see selectUpToMessagesToKeep).
     // 'from' keeps them: summary_B sits AFTER kept (backward scan still
     // works), and removing an old summary would lose its covered history.
     const messagesToKeep =
       direction === 'up_to'
-        ? allMessages
-            .slice(pivotIndex)
-            .filter(
-              m =>
-                m.type !== 'progress' &&
-                !isCompactBoundaryMessage(m) &&
-                !(m.type === 'user' && m.isCompactSummary),
-            )
+        ? selectUpToMessagesToKeep(allMessages, pivotIndex)
         : allMessages.slice(0, pivotIndex).filter(m => m.type !== 'progress')
+    const trigger = options?.trigger ?? 'manual'
 
     if (messagesToSummarize.length === 0) {
       throw new Error(
@@ -861,7 +882,7 @@ export async function partialCompactConversation(
     context.setSDKStatus?.('compacting')
     const hookResult = await executePreCompactHooks(
       {
-        trigger: 'manual',
+        trigger,
         customInstructions: null,
       },
       context.abortController.signal,
@@ -1048,8 +1069,9 @@ export async function partialCompactConversation(
       direction:
         direction as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       hasUserFeedback: !!userFeedback,
-      trigger:
-        'message_selector' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      trigger: (trigger === 'auto'
+        ? 'auto'
+        : 'message_selector') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       compactionInputTokens: compactionUsage?.input_tokens,
       compactionOutputTokens: compactionUsage?.output_tokens,
       compactionCacheReadTokens: compactionUsage?.cache_read_input_tokens ?? 0,
@@ -1065,7 +1087,7 @@ export async function partialCompactConversation(
             ?.uuid
         : messagesToKeep.at(-1)?.uuid
     const boundaryMarker = createCompactBoundaryMessage(
-      'manual',
+      trigger,
       preCompactTokenCount ?? 0,
       lastPreCompactUuid,
       userFeedback,
@@ -1081,23 +1103,27 @@ export async function partialCompactConversation(
     }
 
     const transcriptPath = getTranscriptPath()
+    const isDigest = options?.summaryFraming === 'digest'
     const summaryMessages: UserMessage[] = [
-      createUserMessage({
-        content:
-          options?.summaryFraming === 'digest'
+      {
+        ...createUserMessage({
+          content: isDigest
             ? getDigestUserSummaryMessage(summary, transcriptPath)
             : getCompactUserSummaryMessage(summary, false, transcriptPath),
-        isCompactSummary: true,
-        ...(messagesToKeep.length > 0
-          ? {
-              summarizeMetadata: {
-                messagesSummarized: messagesToSummarize.length,
-                userContext: userFeedback,
-                direction,
-              },
-            }
-          : { isVisibleInTranscriptOnly: true as const }),
-      }),
+          isCompactSummary: true,
+          ...(messagesToKeep.length > 0
+            ? {
+                summarizeMetadata: {
+                  messagesSummarized: messagesToSummarize.length,
+                  userContext: userFeedback,
+                  direction,
+                },
+              }
+            : { isVisibleInTranscriptOnly: true as const }),
+        }),
+        // Persisted with the message so a later 'up_to' keeps the digest.
+        ...(isDigest && { isDigestSummary: true }),
+      },
     ]
 
     if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
@@ -1124,7 +1150,7 @@ export async function partialCompactConversation(
     })
     const postCompactHookResult = await executePostCompactHooks(
       {
-        trigger: 'manual',
+        trigger,
         compactSummary: summary,
       },
       context.abortController.signal,

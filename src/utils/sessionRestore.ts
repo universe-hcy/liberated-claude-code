@@ -21,6 +21,10 @@ import {
 } from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js'
 import { TODO_WRITE_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/TodoWriteTool/constants.js'
 import { asSessionId } from '../types/ids.js'
+import {
+  type PushMarker,
+  projectResumedPushStack,
+} from '../services/pushStack/state.js'
 import type {
   AttributionSnapshotMessage,
   ContextCollapseCommitEntry,
@@ -60,6 +64,38 @@ import {
   getCurrentWorktreeSession,
   restoreWorktreeSession,
 } from './worktree.js'
+
+/**
+ * Push/pop stack for a CLI --resume / -c start: the persisted stack projected
+ * onto the resumed messages (markers whose anchor left the active context are
+ * dropped and announced via the initial notification queue). Fork keeps the
+ * fresh session's empty stack, matching the in-REPL /branch path.
+ */
+function computeResumedPushStackState(
+  result: Pick<ResumeLoadResult, 'messages' | 'pushStack'>,
+  forkSession: boolean,
+  initialState: AppState,
+): Pick<AppState, 'pushStack' | 'notifications'> {
+  if (forkSession) {
+    return {
+      pushStack: initialState.pushStack,
+      notifications: initialState.notifications,
+    }
+  }
+  const { pushStack, notification } = projectResumedPushStack(
+    result.pushStack,
+    result.messages,
+  )
+  return {
+    pushStack,
+    notifications: notification
+      ? {
+          ...initialState.notifications,
+          queue: [...initialState.notifications.queue, notification],
+        }
+      : initialState.notifications,
+  }
+}
 
 type ResumeResult = {
   messages?: Message[]
@@ -313,6 +349,7 @@ type ResumeLoadResult = {
   prUrl?: string
   prRepository?: string
   goal?: import('../types/logs.js').GoalState
+  pushStack?: PushMarker[]
 }
 
 /**
@@ -558,6 +595,13 @@ export async function processResumedConversation(
       ...(resumedAgentType && { agent: resumedAgentType }),
       ...(restoredAttribution && { attribution: restoredAttribution }),
       ...(standaloneAgentContext && { standaloneAgentContext }),
+      ...(feature('PUSH_POP')
+        ? computeResumedPushStackState(
+            result,
+            opts.forkSession,
+            context.initialState,
+          )
+        : {}),
       agentDefinitions: refreshedAgentDefs,
     },
   }

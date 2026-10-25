@@ -247,11 +247,12 @@ export type ToolUseContext = {
   /** Push/pop context stack (docs/features/push-pop-context-stack.md). Only
    *  wired in interactive REPL contexts; the heavy apply logic lives there. */
   pushContextMark?: (note: string) => void
-  applyPop?: (opts: PopOptions) => void
-  /** After a push-stack-aware auto-compact, retain only markers at or after
-   *  the given marker id. Called by autoCompactIfNeeded to sync the REPL's
-   *  pushStack when older markers are consumed by the compaction. */
-  retainPushMarkersFrom?: (fromMarkerId: string) => void
+  /** Awaited by /pop so the digest runs inside the command's queryGuard
+   *  reservation; `abortController` is the command turn's (Esc cancels). */
+  applyPop?: (
+    opts: PopOptions,
+    abortController: AbortController,
+  ) => Promise<void>
   /** Interactive three-way auto-compact strategy picker. When wired (REPL),
    *  the query loop awaits this before deciding full vs. partial compaction.
    *  Not wired in non-interactive / forked-agent contexts. */

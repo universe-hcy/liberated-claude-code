@@ -1,4 +1,7 @@
+import type { AppState } from '../../state/AppState.js'
+import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import type { Task } from '../../utils/tasks.js'
+import { getAgentId, getAgentName, isTeamLead } from '../../utils/teammate.js'
 
 // Unfinished tasks are re-surfaced to the *user* (never injected into the model
 // request) after a turn ends with work still pending. See the long-session
@@ -10,6 +13,62 @@ import type { Task } from '../../utils/tasks.js'
 const STATUS_ORDER: Record<string, number> = {
   in_progress: 0,
   pending: 1,
+}
+
+/**
+ * Owner identities that mean "this REPL's main thread": its own swarm
+ * name/id when it is a teammate, plus the lead's name/id when it leads a team.
+ * Tasks owned by anything else belong to other agents.
+ */
+export function getMainThreadTaskOwners(
+  teamContext: AppState['teamContext'],
+): Set<string> {
+  const owners = [
+    getAgentName(),
+    getAgentId(),
+    teamContext?.selfAgentName,
+    teamContext?.selfAgentId,
+  ]
+  if (isTeamLead(teamContext)) {
+    owners.push(TEAM_LEAD_NAME, teamContext?.leadAgentId)
+  }
+  return new Set(owners.filter((o): o is string => Boolean(o)))
+}
+
+/**
+ * Narrows a task list (which in a swarm is the whole team's) to the
+ * unfinished tasks the main thread can act on: unowned or owned by one of
+ * `selfOwners`, and — for pending tasks — not waiting on an unfinished
+ * blocker (same rule as claimTask; a blocker id that no longer exists counts
+ * as resolved).
+ */
+export function selectActionableTasks(
+  tasks: Task[],
+  selfOwners: ReadonlySet<string>,
+): Task[] {
+  const unresolved = new Set(
+    tasks.filter(t => t.status !== 'completed').map(t => t.id),
+  )
+  return tasks.filter(
+    t =>
+      t.status !== 'completed' &&
+      (!t.owner || selfOwners.has(t.owner)) &&
+      !(t.status === 'pending' && t.blockedBy.some(id => unresolved.has(id))),
+  )
+}
+
+/**
+ * Identity of a reminder: the task list plus each task's id, status and
+ * subject. The REPL re-surfaces the notice only when this changes, so ending
+ * turn after turn on a side topic with the same tasks open doesn't spam it.
+ */
+export function taskReminderKey(taskListId: string, tasks: Task[]): string {
+  return [
+    taskListId,
+    ...[...tasks]
+      .sort((a, b) => Number(a.id) - Number(b.id))
+      .map(t => `${t.id}:${t.status}:${t.subject}`),
+  ].join('\n')
 }
 
 /**

@@ -17,6 +17,8 @@ import {
 } from '../services/analytics/index.js';
 import type { MCPServerConnection, ScopedMcpServerConfig } from '../services/mcp/types.js';
 import { useAppState, useSetAppState } from '../state/AppState.js';
+import { useNotifications } from '../context/notifications.js';
+import { projectResumedPushStack } from '../services/pushStack/state.js';
 import type { Tool } from '../Tool.js';
 import type { AgentColorName } from '@claude-code-best/builtin-tools/tools/AgentTool/agentColorManager.js';
 import type { AgentDefinition } from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js';
@@ -107,6 +109,7 @@ export function ResumeConversation({
   const { rows } = useTerminalSize();
   const agentDefinitions = useAppState(s => s.agentDefinitions);
   const setAppState = useSetAppState();
+  const { addNotification } = useNotifications();
   const [logs, setLogs] = React.useState<LogOption[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [resuming, setResuming] = React.useState(false);
@@ -294,6 +297,15 @@ export function ResumeConversation({
         restoreWorktreeForResume(result.worktreeSession);
         if (result.sessionId) {
           adoptResumedSessionFile();
+        }
+      }
+
+      // Fork keeps the fresh session's empty stack (same as /branch in REPL).
+      if (feature('PUSH_POP')) {
+        if (!forkSession) {
+          const { pushStack, notification } = projectResumedPushStack(result.pushStack, result.messages);
+          setAppState(prev => ({ ...prev, pushStack }));
+          if (notification) addNotification(notification);
         }
       }
 

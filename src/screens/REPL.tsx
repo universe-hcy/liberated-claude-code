@@ -243,6 +243,16 @@ import {
   createCommandInputMessage,
   formatCommandInputTags,
 } from '../utils/messages.js';
+import { tokenCountWithEstimation } from '../utils/tokens.js';
+import { getTaskListId, listTasks } from '../utils/tasks.js';
+import {
+  buildContinuationPrompt,
+  buildUnfinishedTaskNotice,
+  getMainThreadTaskOwners,
+  selectActionableTasks,
+  taskReminderKey,
+} from '../services/api/taskAnchorReminder.js';
+import { detectContextBleedInTurn } from '../services/api/degradationGuard.js';
 import { generateSessionTitle } from '../utils/sessionTitle.js';
 import {
   BASH_INPUT_TAG,
@@ -290,9 +300,11 @@ import {
   type CompactStrategyChoice,
   MAX_PUSH_DEPTH,
   setPushStackMirror,
-  projectPushStackOntoMessages,
+  projectResumedPushStack,
+  prunePushMarkersAfterCompaction,
 } from '../services/pushStack/state.js';
-import { DIGEST_PROMPT, DIGEST_TEMPLATE } from '../services/pushStack/digestPrompt.js';
+import { buildDigestPrompt } from '../services/pushStack/digestPrompt.js';
+import { planPop, popMarkersFrom } from '../services/pushStack/popPlan.js';
 import { CompactStrategyDialog } from '../components/pushStack/CompactStrategyDialog.js';
 import { processSessionStartHooks } from '../utils/sessionStart.js';
 import { executeSessionEndHooks, getSessionEndHookTimeoutMs } from '../utils/hooks.js';
@@ -331,7 +343,11 @@ import {
   reconstructContentReplacementState,
   type ContentReplacementRecord,
 } from '../utils/toolResultStorage.js';
-import { partialCompactConversation, type PartialCompactOptions } from '../services/compact/compact.js';
+import {
+  type CompactionResult,
+  partialCompactConversation,
+  type PartialCompactOptions,
+} from '../services/compact/compact.js';
 import type { LogOption } from '../types/logs.js';
 import type { AgentColorName } from '@claude-code-best/builtin-tools/tools/AgentTool/agentColorManager.js';
 import {
@@ -1699,30 +1715,19 @@ export function REPL({
     [setIsPromptInputActive, repinScroll, trySuggestBgPRIntercept],
   );
 
-  // Pre-filled "按计划继续 Task #N …" instruction for a stalled long task, or
-  // null. Set when a turn ends with in_progress tasks (see the unfinished-task
-  // notice below), refreshed every turn so it can't go stale; consumed by Tab.
-  const [pendingContinuation, setPendingContinuation] = useState<string | null>(null);
-
-  // Tab on an empty prompt pre-fills the continuation instruction for the
-  // highest-priority unfinished task, letting the user re-anchor a stalled long
-  // task with one keystroke instead of blindly typing "继续". It only pre-fills —
-  // the user still presses Enter to send, so nothing is injected behind their
-  // back (unlike the removed silent <system-reminder> injection). The narrow
-  // isActive (empty input + a pending continuation, on the prompt screen) means
-  // normal Tab completion is never shadowed.
-  useInput(
-    (_input, key, event) => {
-      if (key.tab && !key.shift) {
-        setInputValue(pendingContinuation ?? '');
-        setPendingContinuation(null);
-        event.stopImmediatePropagation();
-      }
-    },
-    {
-      isActive: screen === 'prompt' && pendingContinuation !== null && inputValue === '',
-    },
-  );
+  // Pre-filled "按计划继续 Task #N …" instruction for a stalled long task, tagged
+  // with the session it was built for, or null. Set when a turn ends with
+  // in_progress tasks (see the unfinished-task notice below) and consumed by
+  // Tab; cleared on submit and abort. /clear and resume change the session id
+  // (from wherever clearConversation/switchSession is called), which disarms a
+  // continuation built for the previous session.
+  const [pendingContinuation, setPendingContinuation] = useState<{
+    sessionId: string;
+    prompt: string;
+  } | null>(null);
+  // taskReminderKey of the last surfaced unfinished-task notice: the notice is
+  // repeated only when the actionable task set/status (or session) changes.
+  const lastTaskReminderKeyRef = useRef<string | null>(null);
 
   // Schedule a timeout to stop suppressing dialogs after the user stops typing.
   // Only manages the timeout — the immediate activation is handled by setInputValue above.
@@ -1797,10 +1802,15 @@ export function REPL({
   // streaming text_delta. The spinner reads this via its animation timer.
   const responseLengthRef = useRef(0);
   const compactProgressActiveRef = useRef(false);
-  // Pop-specific spinner label (e.g. "Distilling discussion branch #1"). Set by
-  // applyPop before its fire-and-forget digest so the compact_start handler can
-  // show a pop-aware verb instead of the generic "Compacting conversation".
+  // Pop/digest spinner label (e.g. "Distilling discussion branch #1"). Set by
+  // applyPop / the /digest onSummarize branch before compaction so the
+  // compact_start handler can show a digest-aware verb instead of the generic
+  // "Compacting conversation".
   const popSpinnerLabelRef = useRef<string | null>(null);
+  // Defense in depth against a re-entrant /pop: the command's queryGuard
+  // reservation already queues a second /pop typed while one is running; this
+  // rejects any caller that reaches applyPop outside that guard.
+  const popInFlightRef = useRef(false);
   // API performance metrics ref for ant-only spinner display (TTFT/OTPS).
   // Accumulates metrics from all API requests in a turn for P50 aggregation.
   const apiMetricsRef = useRef<
@@ -1865,8 +1875,6 @@ export function REPL({
   const [spinnerShimmerColor, setSpinnerShimmerColor] = useState<keyof Theme | null>(null);
   const [isMessageSelectorVisible, setIsMessageSelectorVisible] = useState(false);
   const [messageSelectorMode, setMessageSelectorMode] = useState<'rewind' | 'digest'>('rewind');
-  // Ref mirror so the onSummarize closure reads the latest mode (avoids stale capture).
-  const messageSelectorModeRef = useRef<'rewind' | 'digest'>('rewind');
   const [messageSelectorPreselect, setMessageSelectorPreselect] = useState<UserMessage | undefined>(undefined);
   const [showCostDialog, setShowCostDialog] = useState(false);
   const [conversationId, setConversationId] = useState(randomUUID());
@@ -2392,18 +2400,15 @@ export function REPL({
         // that no longer exists. Dropped markers are surfaced so a persisted
         // stack is never silently lost. The setAppState below re-triggers the
         // mirror effect, re-persisting the projected (pruned) stack last-wins.
-        // Skipped for /branch (fork) like worktreeSession: forkLog doesn't carry
-        // the stack.
-        if (feature('PUSH_POP') && entrypoint !== 'fork' && log.pushStack?.length) {
-          const { validMarkers, droppedCount } = projectPushStackOntoMessages(log.pushStack, messages);
-          setAppState(prev => ({ ...prev, pushStack: validMarkers }));
-          if (droppedCount > 0) {
-            addNotification({
-              key: 'push-stack-resume-dropped',
-              text: `${droppedCount} push point(s) became invalid after resume (carried off by compaction/snip) and were removed.`,
-              priority: 'medium',
-              timeoutMs: 6000,
-            });
+        // Always overwritten (to [] when the target has no stack) so the
+        // previous session's markers never leak into the resumed one. Skipped
+        // for /branch (fork) like worktreeSession: forkLog doesn't carry the
+        // stack, and the branch keeps the current one.
+        if (feature('PUSH_POP')) {
+          if (entrypoint !== 'fork') {
+            const { pushStack: resumedStack, notification } = projectResumedPushStack(log.pushStack, messages);
+            setAppState(prev => ({ ...prev, pushStack: resumedStack }));
+            if (notification) addNotification(notification);
           }
         }
 
@@ -2533,7 +2538,7 @@ export function REPL({
 
     // Auto-compact strategy picker fires mid-turn (while loading), so it sits
     // in the same high-priority band as tool-permission and is NOT !isLoading-gated.
-    if (feature('PUSH_POP') && allowDialogsWithAnimation && compactStrategyRequest) return 'compact-strategy';
+    if (feature('PUSH_POP') ? allowDialogsWithAnimation && compactStrategyRequest : false) return 'compact-strategy';
 
     if (allowDialogsWithAnimation && toolUseConfirmQueue[0]) return 'tool-permission';
     if (allowDialogsWithAnimation && promptQueue[0]) return 'prompt';
@@ -2594,6 +2599,37 @@ export function REPL({
 
   // Keep ref in sync so timer callbacks can read the current value
   focusedInputDialogRef.current = focusedInputDialog;
+
+  // Tab on an empty prompt pre-fills the continuation instruction for the
+  // highest-priority unfinished task, letting the user re-anchor a stalled long
+  // task with one keystroke instead of blindly typing "继续". It only pre-fills —
+  // the user still presses Enter to send, so nothing is injected behind their
+  // back (unlike the removed silent <system-reminder> injection). Active only
+  // while PromptInput itself is rendered and idle (same condition as its render
+  // below, plus !isLoading) with an empty input, so normal Tab completion and
+  // dialogs' own Tab handling (e.g. "Tab to add feedback") are never shadowed.
+  // A continuation built for another session (/clear, resume) never arms it.
+  useInput(
+    (_input, key, event) => {
+      if (key.tab && !key.shift && pendingContinuation) {
+        setInputValue(pendingContinuation.prompt);
+        setPendingContinuation(null);
+        event.stopImmediatePropagation();
+      }
+    },
+    {
+      isActive:
+        screen === 'prompt' &&
+        pendingContinuation?.sessionId === getSessionId() &&
+        inputValue === '' &&
+        !isLoading &&
+        !toolJSX?.shouldHidePromptInput &&
+        !focusedInputDialog &&
+        !isExiting &&
+        !disabled &&
+        !cursor,
+    },
+  );
 
   // Immediately capture pause/resume when focusedInputDialog changes
   // This ensures accurate timing even under high system load, rather than
@@ -2998,8 +3034,7 @@ export function REPL({
   // reference them without creating circular useCallback dependency chains.
   const pushPopCallbacksRef = useRef<{
     pushContextMark?: (note: string) => void;
-    applyPop?: (opts: PopOptions) => void;
-    retainPushMarkersFrom?: (fromMarkerId: string) => void;
+    applyPop?: (opts: PopOptions, abortController: AbortController) => Promise<void>;
     askCompactStrategy?: (opts: {
       markers: ReadonlyArray<CompactStrategyMarker>;
       signal: AbortSignal;
@@ -3095,7 +3130,6 @@ export function REPL({
         },
         openMessageSelector: (mode: 'rewind' | 'digest' = 'rewind') => {
           if (!disabled) {
-            messageSelectorModeRef.current = mode;
             setMessageSelectorMode(mode);
             setIsMessageSelectorVisible(true);
           }
@@ -3147,13 +3181,14 @@ export function REPL({
               setSpinnerMessage(popSpinnerLabelRef.current ?? 'Compacting conversation');
               compactProgressActiveRef.current = true;
               setCompactProgressActive(true);
-              // /pop runs its digest outside the query loop, so the normal
-              // loading timer never started — seed it here (when idle) so the
-              // spinner's elapsed-time counter starts from 0 rather than a
-              // stale value from a previous turn.
-              if (!isLoading) {
-                loadingStartTimeRef.current = Date.now();
-                totalPausedMsRef.current = 0;
+              // Compaction outside the query loop (/digest, Summarize from the
+              // message selector) never started the loading timer — seed it
+              // here so the spinner's elapsed-time counter starts from 0 rather
+              // than a stale value from a previous turn. Read the guard live:
+              // `isLoading` is not in this callback's deps, so it is stale.
+              // /pop runs inside the guard and resets timing in applyPop.
+              if (!queryGuard.isActive) {
+                resetTimingRefs();
               }
               break;
             case 'compact_end':
@@ -3178,7 +3213,6 @@ export function REPL({
         // would otherwise need the callbacks in its deps array).
         pushContextMark: feature('PUSH_POP') ? pushPopCallbacksRef.current.pushContextMark : undefined,
         applyPop: feature('PUSH_POP') ? pushPopCallbacksRef.current.applyPop : undefined,
-        retainPushMarkersFrom: feature('PUSH_POP') ? pushPopCallbacksRef.current.retainPushMarkersFrom : undefined,
         askCompactStrategy: feature('PUSH_POP') ? pushPopCallbacksRef.current.askCompactStrategy : undefined,
       };
     },
@@ -3215,6 +3249,9 @@ export function REPL({
    * Finds the pivot by uuid so callers (onSummarize, applyPop) don't need the
    * original UserMessage object. The optional `resubmit` param carries the
    * original message for the summarize_from re-edit path; pop omits it.
+   * `abortController` lets a caller running inside a command turn (/pop) share
+   * the turn's controller so Esc cancels the digest. Returns undefined (after
+   * warning) when the pivot is no longer in the active context.
    */
   const applyPartialCompactByUuid = useCallback(
     async (params: {
@@ -3223,7 +3260,8 @@ export function REPL({
       direction: PartialCompactDirection;
       options?: PartialCompactOptions;
       resubmit?: { message: UserMessage };
-    }): Promise<import('../services/compact/compact.js').CompactionResult | undefined> => {
+      abortController?: AbortController;
+    }): Promise<CompactionResult | undefined> => {
       const { pivotUuid, feedback, direction, options: compactOptions, resubmit } = params;
       const compactMessages = getMessagesAfterCompactBoundary(messagesRef.current);
       const messageIndex = compactMessages.findIndex(m => m.uuid === pivotUuid);
@@ -3238,8 +3276,8 @@ export function REPL({
         return undefined;
       }
 
-      const newAbortController = createAbortController();
-      const context = getToolUseContextRef.current!(compactMessages, [], newAbortController, mainLoopModel);
+      const abortController = params.abortController ?? createAbortController();
+      const context = getToolUseContextRef.current!(compactMessages, [], abortController, mainLoopModel);
 
       const appState = context.getAppState();
       const defaultSysPrompt = await getSystemPrompt(
@@ -3308,13 +3346,16 @@ export function REPL({
 
   /**
    * Opens a discussion branch at the current conversation tail (§3 push flow).
-   * Records the last active message uuid + a text snippet as the anchor, then
-   * appends a PushMarker to AppState.pushStack.
+   * Records the last loggable active message uuid + a text snippet as the
+   * anchor, then appends a PushMarker to AppState.pushStack.
    */
   const pushContextMark = useCallback(
     (note: string) => {
       const msgs = getMessagesAfterCompactBoundary(messagesRef.current);
-      const last = msgs.at(-1);
+      // Anchor on a message that is persisted and survives partial compaction:
+      // progress / non-loggable messages are never written to the transcript
+      // (resume would drop the marker) and are filtered out of messagesToKeep.
+      const last = msgs.findLast(isLoggableMessage);
       if (!last) {
         setMessages(prev => [...prev, createSystemMessage('Nothing to push from — conversation is empty.', 'warning')]);
         return;
@@ -3362,133 +3403,134 @@ export function REPL({
   );
 
   /**
+   * Drops push markers whose anchor left the active context (after a digest /
+   * summarize, or a stale /pop target) and tells the user, so a stale marker
+   * never wedges the stack (`/pop` refusing, `/push` reporting "full").
+   */
+  const pruneStalePushPoints = useCallback(() => {
+    prunePushMarkersAfterCompaction(
+      { agentId: undefined, getAppState: store.getState, setAppState, addNotification },
+      messagesRef.current,
+    );
+  }, [store, setAppState, addNotification]);
+
+  /**
    * Closes the discussion branch at the top of the stack (or at marker #N when
    * opts.to is set) by distilling everything after the push point into a digest,
-   * then rewinding to the push point (§3 pop flow).
+   * then rewinding to the push point (§3 pop flow). Awaited by /pop, so the
+   * digest runs inside the command's queryGuard reservation: prompts submitted
+   * meanwhile are queued instead of racing the post-compact setMessages, and
+   * Esc aborts via the command's abortController.
    */
   const applyPop = useCallback(
-    (opts: PopOptions) => {
-      void (async () => {
-        const currentStack = store.getState().pushStack;
-        if (currentStack.length === 0) {
-          setMessages(prev => [
-            ...prev,
-            createSystemMessage('No push point to pop. Use /push [note] to open a discussion branch first.', 'warning'),
-          ]);
-          return;
+    async (opts: PopOptions, abortController: AbortController): Promise<void> => {
+      const warn = (text: string, level: 'warning' | 'error' = 'warning') =>
+        setMessages(prev => [...prev, createSystemMessage(text, level)]);
+      if (popInFlightRef.current) {
+        warn('A /pop is already in progress — wait for it to finish.');
+        return;
+      }
+      popInFlightRef.current = true;
+      try {
+        const activeMessages = getMessagesAfterCompactBoundary(messagesRef.current);
+        const plan = planPop(store.getState().pushStack, activeMessages, opts, selectableUserMessagesFilter);
+        switch (plan.kind) {
+          case 'empty-stack':
+            warn('No push point to pop. Use /push [note] to open a discussion branch first.');
+            return;
+          case 'no-marker':
+            warn(`No push point #${plan.requested} — the stack has ${plan.depth}.`);
+            return;
+          case 'stale':
+            warn(
+              `Push point #${plan.targetIdx + 1} is no longer in the active context (compacted, snipped or rewound); nothing was distilled.`,
+            );
+            pruneStalePushPoints();
+            return;
+          case 'nothing-to-distill':
+            setAppState(prev => ({ ...prev, pushStack: popMarkersFrom(prev.pushStack, plan.marker.id) }));
+            addNotification({
+              key: `pop-empty-${plan.marker.id}`,
+              text: `\u2442 Discussion branch #${plan.targetIdx + 1} closed (nothing to distill).`,
+              priority: 'medium',
+              timeoutMs: 5000,
+            });
+            return;
         }
 
-        // Pick the target marker: plain pop → top; --to #N → markers[N-1].
-        const targetIdx = opts.to !== undefined ? opts.to - 1 : currentStack.length - 1;
-        const marker = currentStack[targetIdx];
-        if (!marker) {
-          setMessages(prev => [
-            ...prev,
-            createSystemMessage(
-              `No push point #${opts.to ?? currentStack.length} — the stack has ${currentStack.length}.`,
-              'warning',
-            ),
-          ]);
-          return;
-        }
-
-        const compactMessages = getMessagesAfterCompactBoundary(messagesRef.current);
-        const markerIndex = compactMessages.findIndex(m => m.uuid === marker.messageUuid);
-        if (markerIndex === -1) {
-          setMessages(prev => [
-            ...prev,
-            createSystemMessage(
-              'That push point is no longer in the active context (snipped or pre-compact). Use /rewind to restore an earlier point.',
-              'warning',
-            ),
-          ]);
-          return;
-        }
-
-        // off-by-one: the marker IS the last main-line message; pivot points to
-        // the first discussion message so the marker stays in the kept prefix.
-        const pivotIndex = markerIndex + 1;
-
-        // §7.1 fast-path: nothing was discussed after the push point.
-        if (pivotIndex >= compactMessages.length) {
-          setAppState(prev => ({ ...prev, pushStack: prev.pushStack.slice(0, targetIdx) }));
+        const { marker, targetIdx, pivotIndex, pivotUuid, branchFirstPromptUuid } = plan;
+        // Files are never rolled back automatically; unless --keep-code, point
+        // out what the branch changed on disk. Snapshots are keyed by user
+        // prompt uuid, hence the branch's first prompt (not the marker anchor).
+        const notifyBranchFileChanges = async () => {
+          if (opts.keepCode || !branchFirstPromptUuid) return;
+          const stats = await fileHistoryGetDiffStats(store.getState().fileHistory, branchFirstPromptUuid);
+          const filesChanged = stats?.filesChanged?.length ?? 0;
+          if (!stats || filesChanged === 0) return;
           addNotification({
-            key: `pop-empty-${marker.id}`,
-            text: `\u2442 Discussion branch #${targetIdx + 1} closed (nothing to distill).`,
+            key: `pop-file-changes-${marker.id}`,
+            text: `\u2442 Discussion branch #${targetIdx + 1} changed ${filesChanged} file(s) (+${stats.insertions} -${stats.deletions}); files were left as-is.`,
             priority: 'medium',
-            timeoutMs: 5000,
+            timeoutMs: 10000,
           });
-          return;
-        }
+        };
 
         if (opts.discard) {
           // --discard: truncate without generating a digest.
-          setMessages(compactMessages.slice(0, pivotIndex));
+          setMessages(activeMessages.slice(0, pivotIndex));
           setConversationId(randomUUID());
-          setAppState(prev => ({ ...prev, pushStack: prev.pushStack.slice(0, targetIdx) }));
+          setAppState(prev => ({ ...prev, pushStack: popMarkersFrom(prev.pushStack, marker.id) }));
           addNotification({
             key: `pop-discard-${marker.id}`,
             text: `\u2442 Discussion branch #${targetIdx + 1} discarded.`,
             priority: 'medium',
             timeoutMs: 5000,
           });
+          await notifyBranchFileChanges();
           return;
         }
 
-        // Digest path: summarize the discussion segment into a structured digest.
-        // Pivot on the FIRST discussion message (marker+1), not the marker
-        // itself — 'from' summarizes slice(pivot) inclusive, and the marker is
-        // the last main-line message that must stay in the kept prefix (§3
-        // off-by-one). The fast-path above guarantees pivotIndex is in range.
-        const firstDiscussionUuid = compactMessages[pivotIndex]!.uuid;
-        let compactResult: import('../services/compact/compact.js').CompactionResult | undefined;
+        // Digest path: summarize the discussion segment (pivot = marker + 1,
+        // so the marker stays in the kept prefix) into a structured digest.
         // Pop-aware spinner label — the compact_start handler reads this so the
         // digest shows "Distilling discussion branch #N" (with live token count
         // + elapsed time) instead of the generic "Compacting conversation".
         popSpinnerLabelRef.current = `\u2442 Distilling discussion branch #${targetIdx + 1}`;
+        resetTimingRefs();
+        let compactResult: CompactionResult | undefined;
         try {
           compactResult = await applyPartialCompactByUuid({
-            pivotUuid: firstDiscussionUuid,
-            feedback: DIGEST_TEMPLATE,
+            pivotUuid,
             direction: 'from',
-            options: { promptOverride: DIGEST_PROMPT, summaryFraming: 'digest' },
+            options: { promptOverride: buildDigestPrompt('pop'), summaryFraming: 'digest' },
+            abortController,
           });
         } catch (err) {
           // On failure don't pop the stack — user can retry or --discard.
-          setMessages(prev => [
-            ...prev,
-            createSystemMessage(
+          if (abortController.signal.aborted) {
+            warn(`Discussion branch #${targetIdx + 1} digest cancelled; the push point was kept.`);
+          } else {
+            warn(
               `Discussion branch digest failed: ${err instanceof Error ? err.message : String(err)}. Retry /pop or use /pop --discard.`,
               'error',
-            ),
-          ]);
+            );
+          }
           return;
         } finally {
           popSpinnerLabelRef.current = null;
         }
+        // Pivot vanished (already warned by applyPartialCompactByUuid).
+        if (!compactResult) return;
 
         // Pop the stack: plain pop removes top; --to #N removes #N and above.
-        setAppState(prev => ({ ...prev, pushStack: prev.pushStack.slice(0, targetIdx) }));
-
-        // File rollback prompt (v1: simple notification, skip if --keep-code).
-        if (!opts.keepCode) {
-          const fileHistory = store.getState().fileHistory;
-          const diffStats = await fileHistoryGetDiffStats(fileHistory, marker.messageUuid);
-          if (diffStats && (diffStats.insertions > 0 || diffStats.deletions > 0)) {
-            addNotification({
-              key: `pop-file-changes-${marker.id}`,
-              text: `\u2442 Discussion changed ${diffStats.filesChanged?.length ?? '?'} file(s). Use /rewind to roll back code changes if needed.`,
-              priority: 'medium',
-              timeoutMs: 10000,
-            });
-          }
-        }
+        setAppState(prev => ({ ...prev, pushStack: popMarkersFrom(prev.pushStack, marker.id) }));
+        await notifyBranchFileChanges();
 
         const historyShortcut = getShortcutDisplay('app:toggleTranscript', 'Global', 'ctrl+o');
         // Before → after context size (0 extra API tokens: pre is already
         // computed during compaction, post is a local message-payload estimate).
-        const pre = compactResult?.preCompactTokenCount;
-        const post = compactResult?.truePostCompactTokenCount;
+        const pre = compactResult.preCompactTokenCount;
+        const post = compactResult.truePostCompactTokenCount;
         const tokenLine =
           pre !== undefined && post !== undefined
             ? ` · Context: ~${formatTokens(pre)} \u2192 ~${formatTokens(post)} tokens`
@@ -3499,29 +3541,26 @@ export function REPL({
           priority: 'medium',
           timeoutMs: 8000,
         });
-      })();
+      } finally {
+        popInFlightRef.current = false;
+      }
     },
-    [store, setAppState, setMessages, setConversationId, addNotification, applyPartialCompactByUuid],
-  );
-
-  /**
-   * Called by autoCompactIfNeeded after a push-stack-aware partial compact.
-   * Retains only markers at or after `fromMarkerId` (the chosen pivot marker).
-   */
-  const retainPushMarkersFrom = useCallback(
-    (fromMarkerId: string) => {
-      setAppState(prev => {
-        const idx = prev.pushStack.findIndex(m => m.id === fromMarkerId);
-        if (idx === -1) return prev;
-        return { ...prev, pushStack: prev.pushStack.slice(idx) };
-      });
-    },
-    [setAppState],
+    [
+      store,
+      setAppState,
+      setMessages,
+      setConversationId,
+      addNotification,
+      applyPartialCompactByUuid,
+      pruneStalePushPoints,
+      resetTimingRefs,
+    ],
   );
 
   // Suspends the query loop (autoCompactIfNeeded awaits this) until the user
   // picks a compaction strategy from the dialog (§4.2). Same suspend/resume
-  // shape as tool-permission prompts. Abort → nearest push point (safe default).
+  // shape as tool-permission prompts. On abort autoCompactIfNeeded skips the
+  // compaction entirely, so the resolved value is ignored.
   const askCompactStrategy = useCallback(
     (opts: { markers: ReadonlyArray<CompactStrategyMarker>; signal: AbortSignal }): Promise<CompactStrategyChoice> => {
       return new Promise<CompactStrategyChoice>(resolve => {
@@ -3553,7 +3592,6 @@ export function REPL({
   // them via ref) always dispatches to the latest callback.
   pushPopCallbacksRef.current.pushContextMark = pushContextMark;
   pushPopCallbacksRef.current.applyPop = applyPop;
-  pushPopCallbacksRef.current.retainPushMarkersFrom = retainPushMarkersFrom;
   pushPopCallbacksRef.current.askCompactStrategy = askCompactStrategy;
 
   // Session backgrounding (Ctrl+B to background/foreground)
@@ -4009,6 +4047,8 @@ export function REPL({
       resetTurnToolDuration();
       resetTurnClassifierDuration();
 
+      // Turn start marker for the degradation guard's scan of this turn's output.
+      const turnStartUuid = messagesRef.current.at(-1)?.uuid;
       for await (const event of query({
         messages: messagesIncludingNewMessages,
         systemPrompt,
@@ -4025,18 +4065,31 @@ export function REPL({
       // When a turn completes naturally (not interrupted) but a task the model
       // itself marked in_progress is still unfinished, surface a display-only
       // local notice so the user doesn't have to blindly nudge "继续". This is a
-      // 'system' message: never sent to the model (0 token cost). Best-effort —
-      // a task-read failure must not affect turn teardown.
-      if (!abortController.signal.aborted) {
+      // 'system' message: never sent to the model (0 token cost). Only tasks the
+      // main thread can act on count (not other teammates', not blocked), and
+      // the notice repeats only when that set changes. Best-effort — a
+      // task-read failure must not affect turn teardown.
+      if (abortController.signal.aborted) {
+        setPendingContinuation(null);
+      } else {
         try {
-          const [{ listTasks, getTaskListId }, { buildUnfinishedTaskNotice, buildContinuationPrompt }] =
-            await Promise.all([import('../utils/tasks.js'), import('../services/api/taskAnchorReminder.js')]);
-          const tasks = await listTasks(getTaskListId());
+          const sessionId = getSessionId();
+          const taskListId = getTaskListId();
+          const tasks = selectActionableTasks(
+            await listTasks(taskListId),
+            getMainThreadTaskOwners(store.getState().teamContext),
+          );
           const notice = buildUnfinishedTaskNotice(tasks);
-          if (notice) {
-            setMessages(prev => [...prev, createSystemMessage(notice, 'warning')]);
-            setPendingContinuation(buildContinuationPrompt(tasks));
+          const prompt = buildContinuationPrompt(tasks);
+          if (notice && prompt) {
+            const key = `${sessionId}\n${taskReminderKey(taskListId, tasks)}`;
+            if (key !== lastTaskReminderKeyRef.current) {
+              lastTaskReminderKeyRef.current = key;
+              setMessages(prev => [...prev, createSystemMessage(notice, 'warning')]);
+            }
+            setPendingContinuation({ sessionId, prompt });
           } else {
+            lastTaskReminderKeyRef.current = null;
             setPendingContinuation(null);
           }
         } catch {
@@ -4050,18 +4103,21 @@ export function REPL({
       // (2026-07-27: the model then hallucinated "file corrupted / tool not
       // executed" while every tool had actually run). Surface a display-only local
       // warning suggesting /rewind. 'system' message: never sent to the model
-      // (0 token cost). Read messagesRef.current — the closure's `messages` may be
-      // stale. Best-effort — a detection failure must not affect turn teardown.
+      // (0 token cost). Scans every assistant response of this turn (messages
+      // after turnStartUuid; if a mid-turn compaction dropped it, everything after
+      // the boundary) and gates on the live post-boundary context size. Read
+      // messagesRef.current — the closure's `messages` may be stale. Best-effort —
+      // a detection failure must not affect turn teardown.
       if (!abortController.signal.aborted) {
         try {
-          const [{ getLastAssistantMessage, getAssistantMessageText }, { detectContextBleed }] = await Promise.all([
-            import('../utils/messages.js'),
-            import('../services/api/degradationGuard.js'),
-          ]);
-          const lastAssistant = getLastAssistantMessage(messagesRef.current);
-          const bleedNotice = lastAssistant
-            ? detectContextBleed(getAssistantMessageText(lastAssistant), messagesRef.current.length)
-            : null;
+          const current = messagesRef.current;
+          const startIndex = current.findIndex(m => m.uuid === turnStartUuid);
+          const turnMessages =
+            startIndex === -1 ? getMessagesAfterCompactBoundary(current) : current.slice(startIndex + 1);
+          const bleedNotice = detectContextBleedInTurn(
+            turnMessages,
+            tokenCountWithEstimation(getMessagesAfterCompactBoundary(current)),
+          );
           if (bleedNotice) {
             setMessages(prev => [...prev, createSystemMessage(bleedNotice, 'warning')]);
           }
@@ -4529,6 +4585,9 @@ export function REPL({
       // Re-pin scroll to bottom on submit so the user always sees the new
       // exchange (matches OpenCode's auto-scroll behavior).
       repinScroll();
+      // Any submit supersedes a pending Tab continuation (it was built for the
+      // previous turn's end state).
+      setPendingContinuation(null);
 
       // Resume loop mode if paused
       if (feature('PROACTIVE') || feature('KAIROS')) {
@@ -7044,7 +7103,7 @@ export function REPL({
                       />
                     )}
                     {showIssueFlagBanner && <IssueFlagBanner />}
-                    {feature('PUSH_POP') && pushStack.length > 0 ? (
+                    {(feature('PUSH_POP') ? pushStack.length > 0 : false) ? (
                       <Box>
                         <Text color="suggestion">{`\u2442${pushStack.length}`}</Text>
                       </Box>
@@ -7125,23 +7184,26 @@ export function REPL({
                       direction: PartialCompactDirection = 'from',
                     ) => {
                       // /digest: distill selected-message → end into a four-column
-                      // digest (reuse pop's DIGEST_PROMPT), NO resubmit.
-                      if (messageSelectorModeRef.current === 'digest') {
+                      // digest (same DIGEST_PROMPT base as /pop), NO resubmit.
+                      if (messageSelectorMode === 'digest') {
                         popSpinnerLabelRef.current = '\u2193 Distilling from selected message';
-                        let r: import('../services/compact/compact.js').CompactionResult | undefined;
+                        let r: CompactionResult | undefined;
                         try {
                           r = await applyPartialCompactByUuid({
                             pivotUuid: message.uuid as UUID,
-                            feedback: feedback ?? DIGEST_TEMPLATE,
+                            feedback,
                             direction: 'from',
-                            options: { promptOverride: DIGEST_PROMPT, summaryFraming: 'digest' },
+                            options: { promptOverride: buildDigestPrompt('digest'), summaryFraming: 'digest' },
                           });
                         } finally {
                           popSpinnerLabelRef.current = null;
                         }
+                        // Pivot left the active context: already warned, nothing changed.
+                        if (!r) return;
+                        pruneStalePushPoints();
                         const historyShortcut = getShortcutDisplay('app:toggleTranscript', 'Global', 'ctrl+o');
-                        const pre = r?.preCompactTokenCount;
-                        const post = r?.truePostCompactTokenCount;
+                        const pre = r.preCompactTokenCount;
+                        const post = r.truePostCompactTokenCount;
                         const tokenLine =
                           pre !== undefined && post !== undefined
                             ? ` \u00b7 Context: ~${formatTokens(pre)} \u2192 ~${formatTokens(post)} tokens`
@@ -7154,12 +7216,14 @@ export function REPL({
                         });
                         return;
                       }
-                      await applyPartialCompactByUuid({
+                      const r = await applyPartialCompactByUuid({
                         pivotUuid: message.uuid as UUID,
                         feedback,
                         direction,
                         resubmit: direction === 'from' ? { message } : undefined,
                       });
+                      if (!r) return;
+                      pruneStalePushPoints();
                       // Show notification with ctrl+o hint
                       const historyShortcut = getShortcutDisplay('app:toggleTranscript', 'Global', 'ctrl+o');
                       addNotification({
@@ -7173,7 +7237,6 @@ export function REPL({
                     onClose={() => {
                       setIsMessageSelectorVisible(false);
                       setMessageSelectorPreselect(undefined);
-                      messageSelectorModeRef.current = 'rewind';
                       setMessageSelectorMode('rewind');
                     }}
                   />

@@ -209,6 +209,9 @@ export async function clearConversation({
         // Clear standalone agent context (name/color set by /rename, /color)
         // so the new session doesn't display the old session's identity badge
         standaloneAgentContext: undefined,
+        // Every push point anchors into the cleared conversation. The REPL's
+        // pushStack effect syncs the mirror and records the empty stack.
+        pushStack: [],
         fileHistory: {
           snapshots: [],
           trackedFiles: new Set(),

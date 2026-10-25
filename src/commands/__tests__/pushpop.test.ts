@@ -8,15 +8,6 @@ mock.module('bun:bundle', () => ({ feature: (_name: string) => false }))
 // Cut bootstrap/state.ts side-effect chain
 mock.module('src/utils/log.ts', logMock)
 mock.module('src/utils/debug.ts', debugMock)
-mock.module('src/utils/config.ts', () => ({
-  getGlobalConfig: () => ({}),
-  saveGlobalConfig: async () => {},
-  getGlobalConfigWriteCount: () => 0,
-}))
-mock.module('src/utils/settings/settings.js', () => ({
-  getCachedOrLoadSettings: async () => ({}),
-  getCachedSettings: () => ({}),
-}))
 
 let parsePopArgs: (
   args: string,
@@ -110,7 +101,7 @@ describe('push stack state', () => {
     const { getPushStackMirror } = await import(
       '../../services/pushStack/state.js'
     )
-    const mirror = getPushStackMirror()
+    const mirror = getPushStackMirror(undefined)
     expect(Array.isArray(mirror)).toBe(true)
     // May have stale content if other tests ran first — just verify it's readable
     expect(mirror).toBeDefined()
@@ -129,7 +120,7 @@ describe('push stack state', () => {
       anchorPreview: 'preview text',
     }
     setPushStackMirror([marker])
-    const stack = getPushStackMirror()
+    const stack = getPushStackMirror(undefined)
     expect(stack.length).toBe(1)
     expect(stack[0]!.id).toBe('test-id')
     expect(stack[0]!.note).toBe('test note')
@@ -211,7 +202,7 @@ describe('projectPushStackOntoMessages', () => {
   })
 })
 
-describe('DIGEST_PROMPT and DIGEST_TEMPLATE', () => {
+describe('digest prompts', () => {
   test('DIGEST_PROMPT contains required four-section structure', async () => {
     const { DIGEST_PROMPT } = await import(
       '../../services/pushStack/digestPrompt.js'
@@ -224,12 +215,17 @@ describe('DIGEST_PROMPT and DIGEST_TEMPLATE', () => {
     expect(DIGEST_PROMPT).toContain('<summary>')
   })
 
-  test('DIGEST_TEMPLATE is a non-empty string', async () => {
-    const { DIGEST_TEMPLATE } = await import(
+  test('buildDigestPrompt keeps the base and adds entry-specific focus', async () => {
+    const { DIGEST_PROMPT, buildDigestPrompt } = await import(
       '../../services/pushStack/digestPrompt.js'
     )
-    expect(typeof DIGEST_TEMPLATE).toBe('string')
-    expect(DIGEST_TEMPLATE.length).toBeGreaterThan(0)
+    const pop = buildDigestPrompt('pop')
+    const digest = buildDigestPrompt('digest')
+    expect(pop.startsWith(DIGEST_PROMPT)).toBe(true)
+    expect(digest.startsWith(DIGEST_PROMPT)).toBe(true)
+    expect(pop).toContain('/pop')
+    expect(digest).toContain('/digest')
+    expect(digest).not.toContain('/pop')
   })
 })
 
@@ -303,6 +299,71 @@ describe('pop command integration', () => {
     expect((result as { type: string; value: string }).value).toMatch(
       /Unknown option/,
     )
+  })
+
+  test('awaits applyPop with the turn abortController, then returns skip', async () => {
+    const { call } = await import('../pop/pop.js')
+    const abortController = new AbortController()
+    const calls: unknown[][] = []
+    const digest = Promise.withResolvers<void>()
+    const ctx = {
+      abortController,
+      getAppState: () => ({
+        pushStack: [
+          {
+            id: 'a',
+            messageUuid: '00000000-0000-0000-0000-000000000001',
+            note: '',
+            timestamp: 0,
+            anchorPreview: '',
+          },
+        ],
+      }),
+      applyPop: (...args: unknown[]) => {
+        calls.push(args)
+        return digest.promise
+      },
+    } as unknown as import('../../Tool.js').ToolUseContext
+    let returned = false
+    const pending = call('--discard', ctx).then(r => {
+      returned = true
+      return r
+    })
+    await Promise.resolve()
+    // The command must not return before the digest settles, so the
+    // queryGuard reservation covers the whole pop.
+    expect(returned).toBe(false)
+    digest.resolve()
+    const result = await pending
+    expect(result.type).toBe('skip')
+    expect(calls).toEqual([[{ discard: true }, abortController]])
+  })
+})
+
+describe('digest command', () => {
+  test('without openMessageSelector returns error text', async () => {
+    const { call } = await import('../digest/digest.js')
+    const ctx = {
+      openMessageSelector: undefined,
+    } as unknown as import('../../Tool.js').ToolUseContext
+    const result = await call('', ctx)
+    expect(result.type).toBe('text')
+    expect((result as { type: string; value: string }).value).toMatch(
+      /interactive session/,
+    )
+  })
+
+  test('opens the selector in digest mode and returns skip', async () => {
+    const { call } = await import('../digest/digest.js')
+    const modes: unknown[] = []
+    const ctx = {
+      openMessageSelector: (mode?: 'rewind' | 'digest') => {
+        modes.push(mode)
+      },
+    } as unknown as import('../../Tool.js').ToolUseContext
+    const result = await call('', ctx)
+    expect(result.type).toBe('skip')
+    expect(modes).toEqual(['digest'])
   })
 })
 

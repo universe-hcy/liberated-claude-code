@@ -54,9 +54,12 @@ Agent 天然只能**顺序处理**：一步步往下跑，一旦某段探索失�
                → 从 M 到对话底部被四栏 digest 替换
 ```
 
-- 选择器复用 `/rewind` 的消息列表 UI，但 digest 模式下选项收敛为两个：**Distill from here into a digest**（可选填一段附加 context 影响蒸馏侧重）与 **Never mind**；标题、拾取提示、确认文案切换为 digest 语义。
+- 选择器复用 `/rewind` 的消息列表 UI，但 digest 模式下选项收敛为两个：**Distill from here into a digest**（可选填一段附加 context 影响蒸馏侧重）与 **Never mind**；标题、拾取提示、确认文案切换为 digest 语义，不显示任何回滚 / 文件改动（diff 统计、"No code restore"、rewind 警告）信息。
+- 选中消息后**总是**先进入 digest 确认页；即使关闭了文件检查点（`fileCheckpointingEnabled=false` / `CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING`），也不会走 rewind 的「免确认直接截断」路径。
 - 蒸馏进行时输入框旁显示 spinner「↓ Distilling from selected message」。
 - 完成后弹出通知：`↓ Distilled from selected message (ctrl+o for history) · Context: ~X → ~Y tokens`，X/Y 为蒸馏前后的上下文规模。
+- 若选中消息已不在活跃上下文（已被 compact / snip），只给出警告，不发成功通知，上下文不变。
+- 蒸馏成功后会把 push 栈重新投影到新上下文：锚点被卷进 digest 的 push 标记被移除并通知数量，避免留下 `/pop` 弹不掉的失效标记。
 
 ### 与 /rewind 的差异
 
@@ -64,17 +67,19 @@ Agent 天然只能**顺序处理**：一步步往下跑，一旦某段探索失�
 
 ## 核心机制
 
-`/digest` 的落地主体复用局部上下文压缩 `applyPartialCompactByUuid`（方向 `from`）——把选中消息之后的段落原地蒸馏替换。这与 `/pop` 走的是同一条压缩路径、同一份 digest 模板，差异只在「选点来源」（命令弹选择器手选 vs 弹栈顶）：
+`/digest` 的落地主体复用局部上下文压缩 `applyPartialCompactByUuid`（方向 `from`）——把选中消息之后的段落原地蒸馏替换。这与 `/pop` 走的是同一条压缩路径、同一份四栏 digest 模板底座，差异只在「选点来源」（命令弹选择器手选 vs 弹栈顶）与模板末尾的入口专属侧重说明：
 
 ```
 applyPartialCompactByUuid({
   pivotUuid: M.uuid,
-  feedback: 用户输入 ?? DIGEST_TEMPLATE,
+  feedback: 用户输入（可为空）,
   direction: 'from',
-  options: { promptOverride: DIGEST_PROMPT, summaryFraming: 'digest' },
+  options: { promptOverride: buildDigestPrompt('digest'), summaryFraming: 'digest' },
   // 注意：无 resubmit —— 蒸馏后不重新触发 agent，只折叠上下文
 })
 ```
+
+`buildDigestPrompt(source)` = 四栏 `DIGEST_PROMPT` + 入口专属侧重（`'pop'`：显式 push 的分支；`'digest'`：事后圈定、可能从探索中途开始）。用户填写的 context 作为「Additional Instructions」**追加**在模板之后，而不是替换模板；`summarizeMetadata.userContext`（摘要卡片里的 `Context: "…"`）只记录用户实际输入的内容。
 
 digest 用固定的四栏结构，让蒸馏物对后续对话可直接消费：
 
@@ -99,8 +104,8 @@ digest 用固定的四栏结构，让蒸馏物对后续对话可直接消费：
 |------|------|------|
 | digest 命令 | `src/commands/digest/` | 命令定义 + 调 `openMessageSelector('digest')` |
 | 消息选择器 | `src/components/MessageSelector.tsx` | `mode` 参数区分 rewind / digest；digest 模式收敛选项与文案 |
-| 应用层 | `src/screens/REPL.tsx` | `messageSelectorMode` state/ref + `onSummarize` 的 digest 分支（无 resubmit + spinner + token 通知） |
-| digest 模板 | `src/services/pushStack/digestPrompt.ts` | 四栏 `DIGEST_PROMPT` + `DIGEST_TEMPLATE`（push/pop 与 digest 共用） |
+| 应用层 | `src/screens/REPL.tsx` | `messageSelectorMode` state + `onSummarize` 的 digest 分支（无 resubmit + spinner + token 通知 + push 栈投影） |
+| digest 模板 | `src/services/pushStack/digestPrompt.ts` | 四栏 `DIGEST_PROMPT` + `buildDigestPrompt('pop' \| 'digest')`（push/pop 与 digest 共用底座） |
 | 局部压缩 | `src/services/compact/compact.ts` | 复用主体；`promptOverride` + `summaryFraming: 'digest'` 参数 |
 
 `ToolUseContext.openMessageSelector` 的签名从 `() => void` 扩展为 `(mode?: 'rewind' \| 'digest') => void`（向后兼容，rewind 不传参）。特性由 feature flag `PUSH_POP` 控制（`FEATURE_PUSH_POP=1`）。

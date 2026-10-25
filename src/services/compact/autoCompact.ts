@@ -12,11 +12,24 @@ import { hasExactErrorMessage } from '../../utils/errors.js'
 import type { CacheSafeParams } from '../../utils/forkedAgent.js'
 import { logError } from '../../utils/log.js'
 import { tokenCountWithEstimation } from '../../utils/tokens.js'
+import type { CompactStrategyChoice } from '../pushStack/state.js'
+import {
+  describeStackAwareFallback,
+  planStackAwareCompact,
+  type StackAwareBudget,
+  type StackAwareFallbackReason,
+} from '../pushStack/compactPlan.js'
+import {
+  getPushStackMirror,
+  prunePushMarkersAfterCompaction,
+} from '../pushStack/state.js'
+import { roughTokenCountEstimationForMessages } from '../tokenEstimation.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
 import { getMaxOutputTokensForModel } from '../api/claude.js'
 import { notifyCompaction } from '../api/promptCacheBreakDetection.js'
 import { setLastSummarizedMessageId } from '../SessionMemory/sessionMemoryUtils.js'
 import {
+  buildPostCompactMessages,
   type CompactionResult,
   compactConversation,
   ERROR_MESSAGE_USER_ABORT,
@@ -24,7 +37,6 @@ import {
   partialCompactConversation,
 } from './compact.js'
 import { getMessagesAfterCompactBoundary } from '../../utils/messages.js'
-import { getPushStackMirror } from '../../services/pushStack/state.js'
 import { runPostCompactCleanup } from './postCompactCleanup.js'
 import { trySessionMemoryCompaction } from './sessionMemoryCompact.js'
 
@@ -329,155 +341,129 @@ export async function autoCompactIfNeeded(
     querySource,
   }
 
-  // EXPERIMENT: Try session memory compaction first
-  const sessionMemoryResult = await trySessionMemoryCompaction(
-    messages,
-    toolUseContext.agentId,
-    recompactionInfo.autoCompactThreshold,
-  )
-  if (sessionMemoryResult) {
-    // Reset lastSummarizedMessageId since session memory compaction prunes messages
-    // and the old message UUID will no longer exist after the REPL replaces messages
-    setLastSummarizedMessageId(undefined)
-    runPostCompactCleanup(querySource)
-    // Reset cache read baseline so the post-compact drop isn't flagged as a
-    // break. compactConversation does this internally; SM-compact doesn't.
-    // BQ 2026-03-01: missing this made 20% of tengu_prompt_cache_break events
-    // false positives (systemPromptChanged=true, timeSinceLastAssistantMsg=-1).
-    if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
-      notifyCompaction(querySource ?? 'compact', toolUseContext.agentId)
-    }
-    markPostCompaction()
-    return {
-      wasCompacted: true,
-      compactionResult: sessionMemoryResult,
+  // Live push points (main thread only) make auto-compaction stack-aware.
+  // Session-memory compaction prunes messages without regard to marker
+  // anchors, so it is skipped while the stack is non-empty.
+  const stack = feature('PUSH_POP')
+    ? getPushStackMirror(toolUseContext.agentId)
+    : []
+
+  if (stack.length === 0) {
+    // EXPERIMENT: Try session memory compaction first
+    const sessionMemoryResult = await trySessionMemoryCompaction(
+      messages,
+      toolUseContext.agentId,
+      recompactionInfo.autoCompactThreshold,
+    )
+    if (sessionMemoryResult) {
+      // Reset lastSummarizedMessageId since session memory compaction prunes messages
+      // and the old message UUID will no longer exist after the REPL replaces messages
+      setLastSummarizedMessageId(undefined)
+      runPostCompactCleanup(querySource)
+      // Reset cache read baseline so the post-compact drop isn't flagged as a
+      // break. compactConversation does this internally; SM-compact doesn't.
+      // BQ 2026-03-01: missing this made 20% of tengu_prompt_cache_break events
+      // false positives (systemPromptChanged=true, timeSinceLastAssistantMsg=-1).
+      if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
+        notifyCompaction(querySource ?? 'compact', toolUseContext.agentId)
+      }
+      markPostCompaction()
+      return {
+        wasCompacted: true,
+        compactionResult: sessionMemoryResult,
+      }
     }
   }
 
-  // Push-stack-aware compaction (§4.2): when markers are present, default to
-  // partial up_to (preserves current branch) instead of full compaction.
-  if (feature('PUSH_POP')) {
-    const stack = getPushStackMirror()
-    if (stack.length > 0) {
-      // The top-of-stack marker is our default pivot (releases the most space
-      // while preserving the user's current discussion branch).
-      const topMarker = stack[stack.length - 1]!
-      const compactMessages = getMessagesAfterCompactBoundary(messages)
-      const topMarkerIndex = compactMessages.findIndex(
-        m => m.uuid === topMarker.messageUuid,
-      )
-
-      // If the top marker is no longer in the active context, fall through to
-      // full compaction (the backstop warning will fire on next /pop attempt).
-      if (topMarkerIndex !== -1) {
-        // askCompactStrategy is only wired in interactive REPL sessions (§4.2).
-        const isInteractive =
-          toolUseContext.options.isNonInteractiveSession === false
-        let chosenMarkerId: string | null = topMarker.id
-        let goFull = false
-
-        if (isInteractive && toolUseContext.askCompactStrategy) {
-          const markerItems = stack.map((m, i) => ({
+  // Push-stack-aware compaction (§4.2): partial up_to at a push point keeps
+  // that branch; full compaction is the fallback whenever the partial cannot
+  // free enough space (see planStackAwareCompact).
+  let fallbackReason: StackAwareFallbackReason | undefined
+  let markerId = stack.at(-1)?.id
+  if (markerId !== undefined) {
+    let choice: CompactStrategyChoice | undefined
+    // askCompactStrategy is only wired in the interactive REPL.
+    if (toolUseContext.askCompactStrategy) {
+      try {
+        choice = await toolUseContext.askCompactStrategy({
+          markers: stack.map((m, i) => ({
             id: m.id,
             note: m.note,
             depth: i + 1,
-          }))
-          try {
-            const choice = await toolUseContext.askCompactStrategy({
-              markers: markerItems,
-              signal: toolUseContext.abortController.signal,
-            })
-            if (choice.kind === 'full') {
-              goFull = true
-            } else {
-              chosenMarkerId = choice.markerId
-            }
-          } catch {
-            // Dialog aborted or errored — fall back to the silent default.
-          }
-        }
-
-        if (!goFull && chosenMarkerId !== null) {
-          // Partial up_to: summarise everything before the chosen marker.
-          const chosenIdx =
-            chosenMarkerId === topMarker.id
-              ? topMarkerIndex
-              : compactMessages.findIndex(
-                  m =>
-                    m.uuid ===
-                    (stack.find(s => s.id === chosenMarkerId)?.messageUuid ??
-                      ''),
-                )
-          if (chosenIdx !== -1) {
-            try {
-              const compactionResult = await partialCompactConversation(
-                compactMessages,
-                chosenIdx,
-                toolUseContext,
-                cacheSafeParams,
-                undefined,
-                'up_to',
-              )
-              setLastSummarizedMessageId(undefined)
-              runPostCompactCleanup(querySource)
-              // Retain only the chosen marker and any newer ones; older markers
-              // are now inside the summary and are no longer valid pop targets.
-              toolUseContext.retainPushMarkersFrom?.(chosenMarkerId)
-              if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
-                notifyCompaction(
-                  querySource ?? 'compact',
-                  toolUseContext.agentId,
-                )
-              }
-              markPostCompaction()
-              // Notify non-interactive callers that older markers were dropped.
-              if (!isInteractive) {
-                const droppedCount = stack.findIndex(
-                  m => m.id === chosenMarkerId,
-                )
-                if (droppedCount > 0) {
-                  toolUseContext.addNotification?.({
-                    key: 'autocompact-push-partial',
-                    text: `Auto-compacted to push point #${stack.length}; removed ${droppedCount} older push point(s).`,
-                    priority: 'medium',
-                    timeoutMs: 8000,
-                  })
-                }
-              }
-              return {
-                wasCompacted: true,
-                compactionResult,
-                consecutiveFailures: 0,
-              }
-            } catch (partialError) {
-              if (
-                !hasExactErrorMessage(partialError, ERROR_MESSAGE_USER_ABORT)
-              ) {
-                logError(partialError)
-              }
-              // Fall through to full compaction on partial failure.
+          })),
+          signal: toolUseContext.abortController.signal,
+        })
+      } catch {
+        // Dialog errored — keep the default (nearest push point).
+      }
+      // Aborted while the dialog was up: the turn is over, don't compact.
+      if (toolUseContext.abortController.signal.aborted) {
+        return { wasCompacted: false }
+      }
+    }
+    if (choice?.kind === 'partial') markerId = choice.markerId
+    if (choice?.kind !== 'full') {
+      const activeMessages = getMessagesAfterCompactBoundary(messages)
+      const estimateTokens = (msgs: readonly Message[]) =>
+        roughTokenCountEstimationForMessages(
+          msgs as Parameters<typeof roughTokenCountEstimationForMessages>[0],
+        )
+      const budget: StackAwareBudget = {
+        // System prompt + tools: API-reported total minus the message estimate.
+        overheadTokens: Math.max(
+          0,
+          tokenCountWithEstimation(activeMessages) -
+            estimateTokens(activeMessages),
+        ),
+        threshold: recompactionInfo.autoCompactThreshold,
+        estimateTokens,
+      }
+      const plan = planStackAwareCompact(
+        activeMessages,
+        stack,
+        markerId,
+        budget,
+      )
+      if (plan.kind === 'full') {
+        fallbackReason = plan.reason
+      } else {
+        try {
+          // Runs notifyCompaction + markPostCompaction internally.
+          const compactionResult = await partialCompactConversation(
+            activeMessages,
+            plan.pivotIndex,
+            toolUseContext,
+            cacheSafeParams,
+            undefined,
+            'up_to',
+            { trigger: 'auto' },
+          )
+          const postTokens = compactionResult.truePostCompactTokenCount ?? 0
+          if (postTokens + budget.overheadTokens < budget.threshold) {
+            setLastSummarizedMessageId(undefined)
+            runPostCompactCleanup(querySource)
+            // Markers older than the pivot are now inside the summary.
+            prunePushMarkersAfterCompaction(
+              toolUseContext,
+              buildPostCompactMessages(compactionResult),
+            )
+            return {
+              wasCompacted: true,
+              compactionResult,
+              consecutiveFailures: 0,
             }
           }
-        }
-        // goFull or partial failed — warn before running full compaction. This
-        // must fire in non-interactive sessions too: otherwise a partial
-        // failure there would drop every push marker silently, violating the
-        // "never silently lose a stack marker" invariant.
-        if (goFull) {
-          toolUseContext.addNotification?.({
-            key: 'autocompact-push-full',
-            text: `Full auto-compact: all ${stack.length} push point(s) have been removed.`,
-            priority: 'medium',
-            timeoutMs: 10000,
-          })
-        } else {
-          // Partial failed/unavailable; full compaction will clear all markers.
-          toolUseContext.addNotification?.({
-            key: 'autocompact-push-full-fallback',
-            text: `Auto-compacted (partial failed); all ${stack.length} push point(s) are now invalid. Use /rewind if needed.`,
-            priority: 'medium',
-            timeoutMs: 10000,
-          })
+          // No meaningful progress: compacting again next turn would only
+          // re-summarize the summary, so go full now.
+          fallbackReason = 'stalled'
+        } catch (partialError) {
+          if (toolUseContext.abortController.signal.aborted) {
+            return { wasCompacted: false }
+          }
+          if (!hasExactErrorMessage(partialError, ERROR_MESSAGE_USER_ABORT)) {
+            logError(partialError)
+          }
+          fallbackReason = 'partial-failed'
         }
       }
     }
@@ -498,6 +484,20 @@ export async function autoCompactIfNeeded(
     // and the old message UUID will no longer exist in the new messages array
     setLastSummarizedMessageId(undefined)
     runPostCompactCleanup(querySource)
+
+    // Full compaction carries every push point's anchor off; drop them now
+    // (after success) and say why the stack-aware partial didn't run.
+    if (markerId !== undefined) {
+      prunePushMarkersAfterCompaction(
+        toolUseContext,
+        buildPostCompactMessages(compactionResult),
+        fallbackReason &&
+          describeStackAwareFallback(
+            fallbackReason,
+            stack.findIndex(m => m.id === markerId) + 1,
+          ),
+      )
+    }
 
     return {
       wasCompacted: true,

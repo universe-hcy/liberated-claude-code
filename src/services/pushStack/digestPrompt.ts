@@ -1,5 +1,6 @@
 /**
- * Digest prompt for `/pop` (docs/features/push-pop-context-stack.md §3, §4.6).
+ * Digest prompt shared by `/pop` and `/digest`
+ * (docs/features/push-pop-context-stack.md §3, §4.6; docs/features/digest.md).
  *
  * Passed as PartialCompactOptions.promptOverride so it REPLACES the generic
  * partial-compact template. It still instructs the model to emit
@@ -22,9 +23,21 @@ Then write the digest in a <summary> block using EXACTLY these four sections, ea
 
 Be precise and faithful — do not invent conclusions the discussion did not reach.`
 
+/** Entry point that scoped the branch being distilled. */
+export type DigestSource = 'pop' | 'digest'
+
+const DIGEST_FOCUS: Record<DigestSource, string> = {
+  pop: 'The branch was opened explicitly with /push and is now closed with /pop. Prioritize decisions and their rationale; keep it tight.',
+  digest:
+    'The branch was selected after the fact with /digest (it was not marked beforehand), so it may begin mid-exploration. Prioritize conclusions and their rationale; keep it tight.',
+}
+
 /**
- * Feedback appended as "Additional Instructions" (secondary to promptOverride).
- * Kept short; the structure is enforced by DIGEST_PROMPT above.
+ * Builds the promptOverride for a digest. The entry-specific focus is part of
+ * the prompt itself (not user feedback), so optional user context is appended
+ * on top as "Additional Instructions" and summarizeMetadata.userContext only
+ * ever records what the user actually typed.
  */
-export const DIGEST_TEMPLATE =
-  'This is a /pop of a discussion branch. Prioritize decisions and their rationale; keep it tight.'
+export function buildDigestPrompt(source: DigestSource): string {
+  return `${DIGEST_PROMPT}\n\n${DIGEST_FOCUS[source]}`
+}

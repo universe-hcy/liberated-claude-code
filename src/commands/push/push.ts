@@ -18,9 +18,8 @@ function renderStackList(stack: readonly PushMarker[]): string {
       style: 'short',
       now,
     })
-    // branchPreview (first message inside the branch) wins over anchorPreview
-    // (the user's instruction at push time); both are truncated conversation text.
-    const preview = m.branchPreview || m.anchorPreview || ''
+    // anchorPreview: the user's instruction at push time (truncated text).
+    const preview = m.anchorPreview || ''
     const note = m.note ? ` · ${m.note}` : ''
     const previewPart = preview ? ` · ${preview}` : ''
     return `#${depth}${note}${previewPart} · ${when} · depth ${depth}`

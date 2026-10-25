@@ -3251,6 +3251,7 @@ const METADATA_TYPE_MARKERS = [
   '"type":"goal"',
   '"type":"goal-cleared"',
   '"type":"pr-link"',
+  '"type":"push-stack"',
 ]
 const METADATA_MARKER_BUFS = METADATA_TYPE_MARKERS.map(m => Buffer.from(m))
 // Longest marker is 22 bytes; +1 for leading `{` = 23.
